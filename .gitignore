@@ -1,0 +1,34 @@
+# Build outputs and generated Windows resources
+/dist/
+/cmd/video-manager/*.syso
+/.build/
+/bin/
+*.exe
+
+# Runtime state
+/data/
+*.log
+*.tmp
+
+# Local Go caches and workspace files
+/.gocache/
+/.gomodcache/
+/.tmp-go/
+/go.work
+/go.work.sum
+
+# Local editor and agent state
+/.agents/
+/.codex/
+/.vscode/
+/.idea/
+*.user
+*.suo
+
+# Original local artwork; assets/app.ico is the repository application icon
+/ico.png
+
+# Operating-system metadata
+Thumbs.db
+Desktop.ini
+.DS_Store
