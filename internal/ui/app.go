@@ -111,40 +111,41 @@ type app struct {
 	controls  map[int]win.HWND
 	levelRows []levelRow
 
-	mu               sync.Mutex
-	scanResult       archive.ScanResult
-	currentPlan      archive.MovePlan
-	moveSummary      archive.MoveSummary
-	undoSummary      archive.UndoSummary
-	moveStatus       string
-	moveDone         int
-	moveTotal        int
-	moveCancel       context.CancelFunc
-	scanCancel       context.CancelFunc
-	scanStatus       string
-	dryRunCancel     context.CancelFunc
-	dryRunPreview    string
-	dryRunTSV        string
-	dryRunError      string
-	dryRunLines      []string
-	dryRunPage       int
-	progressTotal    int
-	progressBusy     bool
-	lastManifest     string
-	scanning         bool
-	dryRunning       bool
-	moving           bool
-	initializing     bool
-	logCh            chan string
-	logOnce          sync.Once
-	configWriteMu    sync.Mutex
-	configSequence   uint64
-	configWritten    uint64
-	pendingConfig    appconfig.Config
-	configLoadErr    error
-	configEdited     bool
-	closing          bool
-	closeSaveStarted bool
+	mu                sync.Mutex
+	scanResult        archive.ScanResult
+	currentPlan       archive.MovePlan
+	currentPlanConfig archive.PlanConfig
+	moveSummary       archive.MoveSummary
+	undoSummary       archive.UndoSummary
+	moveStatus        string
+	moveDone          int
+	moveTotal         int
+	moveCancel        context.CancelFunc
+	scanCancel        context.CancelFunc
+	scanStatus        string
+	dryRunCancel      context.CancelFunc
+	dryRunPreview     string
+	dryRunTSV         string
+	dryRunError       string
+	dryRunLines       []string
+	dryRunPage        int
+	progressTotal     int
+	progressBusy      bool
+	lastManifest      string
+	scanning          bool
+	dryRunning        bool
+	moving            bool
+	initializing      bool
+	logCh             chan string
+	logOnce           sync.Once
+	configWriteMu     sync.Mutex
+	configSequence    uint64
+	configWritten     uint64
+	pendingConfig     appconfig.Config
+	configLoadErr     error
+	configEdited      bool
+	closing           bool
+	closeSaveStarted  bool
 }
 
 type levelRow struct {
@@ -476,12 +477,14 @@ func (a *app) handleCommand(wParam, lParam uintptr) {
 	case idBrowse:
 		if code == win.BN_CLICKED {
 			current := strings.TrimSpace(a.text(a.controls[idSourceEdit]))
+			oldTarget := strings.TrimSpace(a.text(a.controls[idTargetEdit]))
 			if path := browseFolder(a.hwnd, "选择视频源目录", current); path != "" {
 				a.setText(a.controls[idSourceEdit], path)
-				if strings.TrimSpace(a.text(a.controls[idTargetEdit])) == "" {
+				if shouldFollowSourceTarget(current, oldTarget) {
 					a.setText(a.controls[idTargetEdit], filepath.Join(path, "_Archived"))
 				}
-				a.log("已选择目录: " + path)
+				a.log("已选择源目录: " + path)
+				a.log("当前目标目录: " + strings.TrimSpace(a.text(a.controls[idTargetEdit])))
 			}
 		}
 	case idBrowseTarget:
@@ -529,15 +532,98 @@ func (a *app) handleCommand(wParam, lParam uintptr) {
 			sel := int(win.SendMessage(a.controls[idPreset], win.CB_GETCURSEL, 0, 0))
 			a.applyPreset(sel)
 			a.recalculate()
+			a.invalidatePlanForConfigurationChange()
 		}
 	default:
+		if !a.initializing && lParam != 0 && code == win.EN_CHANGE && (id == idSourceEdit || id == idTargetEdit) {
+			a.invalidatePathDependentState()
+		}
 		if !a.initializing && lParam != 0 && code == win.EN_CHANGE && a.isCalculatorInput(id) {
 			if id == idLevelCount {
 				a.updateLevelVisibility()
 			}
 			a.recalculate()
 		}
+		if !a.initializing && lParam != 0 && code == win.EN_CHANGE && isPlanConfigurationControl(id) {
+			a.invalidatePlanForConfigurationChange()
+		}
 	}
+}
+
+func shouldFollowSourceTarget(oldSource, oldTarget string) bool {
+	oldSource = strings.TrimSpace(oldSource)
+	oldTarget = strings.TrimSpace(oldTarget)
+	if oldTarget == "" {
+		return true
+	}
+	if oldSource == "" {
+		return false
+	}
+	expected := filepath.Join(oldSource, "_Archived")
+	return strings.EqualFold(filepath.Clean(oldTarget), filepath.Clean(expected))
+}
+
+func (a *app) invalidatePathDependentState() {
+	a.mu.Lock()
+	if a.scanning || a.dryRunning || a.moving {
+		a.mu.Unlock()
+		return
+	}
+	a.scanResult = archive.ScanResult{}
+	a.currentPlan = archive.MovePlan{}
+	a.currentPlanConfig = archive.PlanConfig{}
+	a.dryRunPreview = ""
+	a.dryRunLines = nil
+	a.dryRunTSV = ""
+	a.dryRunError = ""
+	hasManifest := a.lastManifest != ""
+	a.mu.Unlock()
+
+	a.setText(a.controls[idPreview], "路径已变化，请重新扫描并生成 Dry-run。")
+	a.setActionState(true, false, false, false, hasManifest)
+}
+
+func isPlanConfigurationControl(id int) bool {
+	if id == idLevelCount || id == idFilesLeaf {
+		return true
+	}
+	return (id >= idLevelNameBase && id < idLevelNameBase+maxLevels) ||
+		(id >= idLevelFolderBase && id < idLevelFolderBase+maxLevels)
+}
+
+func (a *app) invalidatePlanForConfigurationChange() {
+	a.mu.Lock()
+	if a.scanning || a.dryRunning || a.moving || len(a.currentPlan.Items) == 0 {
+		a.mu.Unlock()
+		return
+	}
+	a.currentPlan = archive.MovePlan{}
+	a.currentPlanConfig = archive.PlanConfig{}
+	hasScan := len(a.scanResult.Files) > 0
+	hasManifest := a.lastManifest != ""
+	a.mu.Unlock()
+
+	a.setText(a.controls[idPreview], "归档结构配置已变化，请重新生成 Dry-run。")
+	a.setActionState(true, hasScan, false, false, hasManifest)
+}
+
+func samePlanConfig(left, right archive.PlanConfig) bool {
+	if !strings.EqualFold(filepath.Clean(strings.TrimSpace(left.TargetDir)), filepath.Clean(strings.TrimSpace(right.TargetDir))) ||
+		left.LevelCount != right.LevelCount || left.FilesPerLeaf != right.FilesPerLeaf ||
+		len(left.LevelNames) != len(right.LevelNames) || len(left.FoldersPerLevel) != len(right.FoldersPerLevel) {
+		return false
+	}
+	for i := range left.LevelNames {
+		if left.LevelNames[i] != right.LevelNames[i] {
+			return false
+		}
+	}
+	for i := range left.FoldersPerLevel {
+		if left.FoldersPerLevel[i] != right.FoldersPerLevel[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func isConfigurationCommand(id, code int) bool {
@@ -599,6 +685,7 @@ func (a *app) startScan() {
 			a.mu.Lock()
 			a.scanResult = archive.ScanResult{SourceDir: source, ErrorCount: 1, Errors: []string{err.Error()}}
 			a.currentPlan = archive.MovePlan{}
+			a.currentPlanConfig = archive.PlanConfig{}
 			a.scanning = false
 			a.scanCancel = nil
 			a.mu.Unlock()
@@ -624,6 +711,7 @@ func (a *app) startScan() {
 		a.mu.Lock()
 		a.scanResult = result
 		a.currentPlan = archive.MovePlan{}
+		a.currentPlanConfig = archive.PlanConfig{}
 		a.scanning = false
 		a.scanCancel = nil
 		a.mu.Unlock()
@@ -658,6 +746,10 @@ func (a *app) finishScan() {
 	a.setProgressBusy(false)
 	a.setProgress(1, 1)
 	a.recalculate()
+	if len(result.Files) == 0 && !result.Cancelled {
+		a.log("当前源目录未扫描到视频，无法生成 Dry-run: " + result.SourceDir)
+		a.setText(a.controls[idPreview], "未扫描到视频。\r\n\r\n当前源目录："+result.SourceDir+"\r\n\r\n请选择包含视频的源目录后重新扫描。")
+	}
 }
 
 func (a *app) generateDryRun() {
@@ -762,6 +854,7 @@ func (a *app) generateDryRun() {
 		a.mu.Lock()
 		if ctx.Err() == nil {
 			a.currentPlan = plan
+			a.currentPlanConfig = cfg
 		}
 		a.dryRunLines = lines
 		a.dryRunTSV = tsvPath
@@ -845,8 +938,10 @@ func (a *app) startMove() {
 		return
 	}
 	plan := a.currentPlan
+	planCfg := a.currentPlanConfig
 	a.mu.Unlock()
-	if err := archive.ValidateLevelNames(a.planConfig(len(plan.Items)).LevelNames); err != nil {
+	currentCfg := a.planConfig(len(plan.Items))
+	if err := archive.ValidateLevelNames(currentCfg.LevelNames); err != nil {
 		a.log("目录名配置无效: " + err.Error())
 		return
 	}
@@ -856,6 +951,11 @@ func (a *app) startMove() {
 	}
 	if plan.ErrorCount > 0 {
 		a.log("当前 dry-run 存在错误项，请修正后重新生成。")
+		return
+	}
+	if !samePlanConfig(planCfg, currentCfg) {
+		a.log("归档结构配置或目标目录已变化，请重新生成 dry-run。")
+		a.invalidatePlanForConfigurationChange()
 		return
 	}
 	confirmText := fmt.Sprintf("即将移动 %d 个文件。\r\n目标目录：%s\r\n\r\n确认开始正式移动？", len(plan.Items), plan.TargetRoot)
@@ -1017,6 +1117,7 @@ func (a *app) finishMove() {
 	a.mu.Lock()
 	summary := a.moveSummary
 	a.currentPlan = archive.MovePlan{}
+	a.currentPlanConfig = archive.PlanConfig{}
 	a.mu.Unlock()
 	a.setConfigurationEnabled(true)
 	a.setActionState(true, false, false, false, summary.ManifestPath != "" && summary.Moved > 0)
