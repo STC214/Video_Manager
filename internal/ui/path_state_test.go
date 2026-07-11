@@ -4,6 +4,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/lxn/win"
 	"video-manager/internal/archive"
 )
 
@@ -47,6 +48,11 @@ func TestSamePlanConfig(t *testing.T) {
 	if !samePlanConfig(base, copyConfig()) {
 		t.Fatal("identical configs should match")
 	}
+	extendedTarget := copyConfig()
+	extendedTarget.TargetDir = `\\?\Z:\archive`
+	if !samePlanConfig(base, extendedTarget) {
+		t.Fatal("equivalent extended-prefix target should match")
+	}
 	changed := copyConfig()
 	changed.FilesPerLeaf++
 	if samePlanConfig(base, changed) {
@@ -61,5 +67,54 @@ func TestSamePlanConfig(t *testing.T) {
 	changed.TargetDir = `Z:\other`
 	if samePlanConfig(base, changed) {
 		t.Fatal("changed target should invalidate the plan")
+	}
+}
+
+func TestPlanErrorMessagesDeduplicatesAndLimits(t *testing.T) {
+	plan := archive.MovePlan{
+		ErrorCount: 3,
+		Items: []archive.MovePlanItem{
+			{Error: "target directory is not readable"},
+			{Error: "target directory is not readable"},
+			{Error: "source file is unavailable"},
+		},
+	}
+	if got := planErrorMessages(plan, 10); len(got) != 2 || got[0] != "target directory is not readable" || got[1] != "source file is unavailable" {
+		t.Fatalf("planErrorMessages() = %v", got)
+	}
+	if got := planErrorMessages(plan, 1); len(got) != 1 || got[0] != "target directory is not readable" {
+		t.Fatalf("planErrorMessages(limit=1) = %v", got)
+	}
+}
+
+func TestBrowseCommandDoesNotMarkConfigurationEditedUntilPathChanges(t *testing.T) {
+	if isConfigurationCommand(idBrowse, win.BN_CLICKED) || isConfigurationCommand(idBrowseTarget, win.BN_CLICKED) {
+		t.Fatal("opening or cancelling a folder picker must not count as a configuration edit")
+	}
+	if !isConfigurationCommand(idSourceEdit, win.EN_CHANGE) || !isConfigurationCommand(idTargetEdit, win.EN_CHANGE) {
+		t.Fatal("an actual path text change must count as a configuration edit")
+	}
+}
+
+func TestManifestAfterMoveKeepsOnlyUndoableRun(t *testing.T) {
+	if got, changed := manifestAfterMove("previous.tsv", archive.MoveSummary{ManifestPath: "failed.tsv", Moved: 0}); got != "previous.tsv" || changed {
+		t.Fatalf("zero-move result = %q, %v", got, changed)
+	}
+	if got, changed := manifestAfterMove("", archive.MoveSummary{ManifestPath: "failed.tsv", Moved: 0}); got != "" || changed {
+		t.Fatalf("zero-move result without previous manifest = %q, %v", got, changed)
+	}
+	if got, changed := manifestAfterMove("previous.tsv", archive.MoveSummary{ManifestPath: "new.tsv", Moved: 1}); got != "new.tsv" || !changed {
+		t.Fatalf("successful move result = %q, %v", got, changed)
+	}
+}
+
+func TestPrependLogMessageKeepsNewestFirst(t *testing.T) {
+	got := prependLogMessage("second\r\nfirst", "third", 3)
+	if got != "third\r\nsecond\r\nfirst" {
+		t.Fatalf("prependLogMessage() = %q", got)
+	}
+	got = prependLogMessage(got, "fourth", 3)
+	if got != "fourth\r\nthird\r\nsecond" {
+		t.Fatalf("limited prependLogMessage() = %q", got)
 	}
 }

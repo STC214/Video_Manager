@@ -99,12 +99,16 @@ type MovePlanItem struct {
 }
 
 type MovePlan struct {
-	Items            []MovePlanItem
-	TargetRoot       string
-	TargetDirCount   int
-	ConflictCount    int
-	ErrorCount       int
-	RequiredLeafDirs int
+	Items              []MovePlanItem
+	TargetRoot         string
+	TargetDirCount     int
+	ConflictCount      int
+	ErrorCount         int
+	RequiredLeafDirs   int
+	AutoExpanded       bool
+	ConfiguredCapacity int
+	EffectiveCapacity  int
+	EffectiveFolders   []int
 }
 
 func BuildMovePlan(files []VideoFile, cfg PlanConfig) MovePlan {
@@ -130,18 +134,15 @@ func BuildMovePlanContext(ctx context.Context, files []VideoFile, cfg PlanConfig
 	capResult := CalculateCapacity(capCfg)
 	result.RequiredLeafDirs = capResult.RequiredLeafDirs
 	if !capResult.Enough {
-		for _, file := range files {
-			result.Items = append(result.Items, MovePlanItem{
-				SourcePath: file.SourcePath,
-				Size:       file.Size,
-				ModTime:    file.ModTime,
-				Status:     "error",
-				Error:      "capacity is not enough for all files",
-			})
-		}
-		result.ErrorCount = len(result.Items)
-		return result
+		result.AutoExpanded = true
+		result.ConfiguredCapacity = capResult.MaxCapacity
+		capBelowFirst := product(capCfg.FoldersPerLevel[1:])
+		capCfg.FoldersPerLevel = append([]int(nil), capCfg.FoldersPerLevel...)
+		capCfg.FoldersPerLevel[0] = ceilDiv(capResult.RequiredLeafDirs, capBelowFirst)
+		capResult = CalculateCapacity(capCfg)
 	}
+	result.EffectiveCapacity = capResult.MaxCapacity
+	result.EffectiveFolders = append([]int(nil), capCfg.FoldersPerLevel...)
 
 	targetRoot := filepath.Clean(strings.TrimSpace(cfg.TargetDir))
 	result.TargetRoot = targetRoot
@@ -247,8 +248,13 @@ func (r *targetResolver) loadDir(dir string) error {
 	names := map[string]struct{}{}
 	entries, err := os.ReadDir(fsPath(dir))
 	if os.IsNotExist(err) {
-		r.dirs[key] = names
-		return nil
+		if ancestorErr := validateTargetDirAncestors(dir); ancestorErr != nil {
+			r.dirErrs[key] = ancestorErr
+			return ancestorErr
+		} else {
+			r.dirs[key] = names
+			return nil
+		}
 	}
 	if err != nil {
 		err = retryIOPaths(r.ctx, 3, []string{dir}, func() error {
@@ -266,6 +272,27 @@ func (r *targetResolver) loadDir(dir string) error {
 	}
 	r.dirs[key] = names
 	return nil
+}
+
+func validateTargetDirAncestors(dir string) error {
+	current := filepath.Clean(dir)
+	for {
+		info, err := os.Stat(fsPath(current))
+		if err == nil {
+			if !info.IsDir() {
+				return fmt.Errorf("target path component is not a directory: %s", current)
+			}
+			return nil
+		}
+		if !os.IsNotExist(err) {
+			return err
+		}
+		parent := filepath.Dir(current)
+		if parent == current {
+			return nil
+		}
+		current = parent
+	}
 }
 
 func (r *targetResolver) exists(path string) bool {

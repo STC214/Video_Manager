@@ -148,7 +148,6 @@ func moveOne(ctx context.Context, item MovePlanItem) (string, error) {
 	if err := retryIOPaths(ctx, 2, []string{item.SourcePath, item.TargetPath}, func() error {
 		return os.Rename(fsPath(item.SourcePath), fsPath(item.TargetPath))
 	}); err == nil {
-		_ = os.Chtimes(fsPath(item.TargetPath), sourceInfo.ModTime(), sourceInfo.ModTime())
 		return "moved", nil
 	}
 
@@ -159,12 +158,14 @@ func moveOne(ctx context.Context, item MovePlanItem) (string, error) {
 }
 
 func copyVerifyDelete(ctx context.Context, sourcePath, targetPath string, sourceInfo os.FileInfo) error {
+	return copyVerifyDeleteWithHooks(ctx, sourcePath, targetPath, sourceInfo, nil, os.Chtimes)
+}
+
+func copyVerifyDeleteWithHooks(ctx context.Context, sourcePath, targetPath string, sourceInfo os.FileInfo, afterCopy func(), setTimes func(string, time.Time, time.Time) error) error {
 	source, err := os.Open(fsPath(sourcePath))
 	if err != nil {
 		return err
 	}
-	defer source.Close()
-
 	var target *os.File
 	err = retryIOPaths(ctx, 3, []string{sourcePath, targetPath}, func() error {
 		var openErr error
@@ -172,9 +173,11 @@ func copyVerifyDelete(ctx context.Context, sourcePath, targetPath string, source
 		return openErr
 	})
 	if err != nil {
+		_ = source.Close()
 		return err
 	}
 	_, copyErr := copyWithContext(ctx, target, source)
+	sourceCloseErr := source.Close()
 	closeErr := target.Close()
 	if copyErr != nil {
 		_ = os.Remove(fsPath(targetPath))
@@ -183,6 +186,13 @@ func copyVerifyDelete(ctx context.Context, sourcePath, targetPath string, source
 	if closeErr != nil {
 		_ = os.Remove(fsPath(targetPath))
 		return closeErr
+	}
+	if sourceCloseErr != nil {
+		_ = os.Remove(fsPath(targetPath))
+		return sourceCloseErr
+	}
+	if afterCopy != nil {
+		afterCopy()
 	}
 
 	targetInfo, err := os.Stat(fsPath(targetPath))
@@ -194,7 +204,20 @@ func copyVerifyDelete(ctx context.Context, sourcePath, targetPath string, source
 		_ = os.Remove(fsPath(targetPath))
 		return fmt.Errorf("copy verify failed: source size %d, target size %d", sourceInfo.Size(), targetInfo.Size())
 	}
-	_ = os.Chtimes(fsPath(targetPath), sourceInfo.ModTime(), sourceInfo.ModTime())
+	currentSourceInfo, err := os.Stat(fsPath(sourcePath))
+	if err != nil {
+		_ = os.Remove(fsPath(targetPath))
+		return fmt.Errorf("source revalidation after copy failed: %w", err)
+	}
+	if currentSourceInfo.Size() != sourceInfo.Size() || !currentSourceInfo.ModTime().Equal(sourceInfo.ModTime()) {
+		_ = os.Remove(fsPath(targetPath))
+		return fmt.Errorf("source file changed during copy: size %d -> %d, modification time %s -> %s",
+			sourceInfo.Size(), currentSourceInfo.Size(), sourceInfo.ModTime().Format(time.RFC3339Nano), currentSourceInfo.ModTime().Format(time.RFC3339Nano))
+	}
+	if err := setTimes(fsPath(targetPath), sourceInfo.ModTime(), sourceInfo.ModTime()); err != nil {
+		_ = os.Remove(fsPath(targetPath))
+		return fmt.Errorf("cannot preserve target modification time: %w", err)
+	}
 	return retryIOPaths(ctx, 3, []string{sourcePath}, func() error {
 		return os.Remove(fsPath(sourcePath))
 	})

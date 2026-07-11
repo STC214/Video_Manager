@@ -11,7 +11,7 @@ import (
 func PreviewEmptyDirs(ctx context.Context, root string, protectedRoots []string) ([]string, []string) {
 	var dirs []string
 	var errors []string
-	root = filepath.Clean(root)
+	root = displayPath(root)
 	walkRoot := fsPath(root)
 	protected := normalizeExcluded(protectedRoots)
 
@@ -65,7 +65,7 @@ func PreviewEmptyDirs(ctx context.Context, root string, protectedRoots []string)
 func CleanupEmptyDirs(ctx context.Context, root string, protectedRoots []string) (int, []string) {
 	var dirs []string
 	var errors []string
-	root = filepath.Clean(root)
+	root = displayPath(root)
 	walkRoot := fsPath(root)
 	protected := normalizeExcluded(protectedRoots)
 

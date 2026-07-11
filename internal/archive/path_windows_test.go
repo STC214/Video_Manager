@@ -25,3 +25,15 @@ func TestDisplayPathTrimsExtendedPrefix(t *testing.T) {
 		t.Fatalf("unexpected UNC display path: %q", got)
 	}
 }
+
+func TestSamePathNormalizesWindowsPaths(t *testing.T) {
+	if !SamePath(`Z:\Videos\Source\`, `z:\videos\source`) {
+		t.Fatal("expected paths with case and trailing slash differences to match")
+	}
+	if !SamePath(`\\?\Z:\Videos\Source`, `Z:\Videos\Source`) {
+		t.Fatal("expected extended and display paths to match")
+	}
+	if SamePath(`Z:\Videos\Source`, `Z:\Videos\Target`) {
+		t.Fatal("different paths must not match")
+	}
+}

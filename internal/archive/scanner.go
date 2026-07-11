@@ -52,7 +52,7 @@ func ScanVideosWithProgress(ctx context.Context, sourceDir string, excludedRoots
 		SourceDir: sourceDir,
 		ExtCounts: map[string]int{},
 	}
-	sourceDir = filepath.Clean(sourceDir)
+	sourceDir = displayPath(sourceDir)
 	walkRoot := fsPath(sourceDir)
 	excluded := normalizeExcluded(excludedRoots)
 	visited := 0
@@ -159,7 +159,7 @@ func IsVideoExt(ext string) bool {
 func normalizeExcluded(paths []string) map[string]struct{} {
 	excluded := make(map[string]struct{}, len(paths))
 	for _, path := range paths {
-		path = strings.ToLower(filepath.Clean(strings.TrimSpace(path)))
+		path = strings.ToLower(displayPath(path))
 		if path != "." && path != "" {
 			excluded[path] = struct{}{}
 		}

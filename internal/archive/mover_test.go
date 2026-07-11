@@ -2,11 +2,113 @@ package archive
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
+
+func TestCopyVerifyDeleteRejectsSourceChangedDuringCopy(t *testing.T) {
+	root := t.TempDir()
+	source := filepath.Join(root, "source.mp4")
+	target := filepath.Join(root, "target.mp4")
+	if err := os.WriteFile(source, []byte("video"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = copyVerifyDeleteWithHooks(context.Background(), source, target, info, func() {
+		changed := info.ModTime().Add(time.Hour)
+		if changeErr := os.Chtimes(source, changed, changed); changeErr != nil {
+			t.Fatalf("change source time: %v", changeErr)
+		}
+	}, os.Chtimes)
+	if err == nil || !strings.Contains(err.Error(), "source file changed during copy") {
+		t.Fatalf("copy error = %v", err)
+	}
+	if _, err := os.Stat(source); err != nil {
+		t.Fatalf("changed source must remain: %v", err)
+	}
+	if _, err := os.Stat(target); !os.IsNotExist(err) {
+		t.Fatalf("invalid target must be removed: %v", err)
+	}
+}
+
+func TestCopyVerifyDeleteRevalidatesAndDeletesStableSource(t *testing.T) {
+	root := t.TempDir()
+	source := filepath.Join(root, "source.mp4")
+	target := filepath.Join(root, "target.mp4")
+	if err := os.WriteFile(source, []byte("video"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := copyVerifyDelete(context.Background(), source, target, info); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(source); !os.IsNotExist(err) {
+		t.Fatalf("stable source should be deleted: %v", err)
+	}
+	targetInfo, err := os.Stat(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if targetInfo.Size() != info.Size() || !targetInfo.ModTime().Equal(info.ModTime()) {
+		t.Fatalf("target metadata = size %d, time %s; want size %d, time %s", targetInfo.Size(), targetInfo.ModTime(), info.Size(), info.ModTime())
+	}
+}
+
+func TestCopyVerifyDeletePreservesSourceWhenTargetTimeFails(t *testing.T) {
+	root := t.TempDir()
+	source := filepath.Join(root, "source.mp4")
+	target := filepath.Join(root, "target.mp4")
+	if err := os.WriteFile(source, []byte("video"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = copyVerifyDeleteWithHooks(context.Background(), source, target, info, nil, func(string, time.Time, time.Time) error {
+		return errors.New("timestamps unsupported")
+	})
+	if err == nil || !strings.Contains(err.Error(), "cannot preserve target modification time") {
+		t.Fatalf("copy error = %v", err)
+	}
+	if _, err := os.Stat(source); err != nil {
+		t.Fatalf("source must remain when timestamps fail: %v", err)
+	}
+	if _, err := os.Stat(target); !os.IsNotExist(err) {
+		t.Fatalf("target with invalid metadata must be removed: %v", err)
+	}
+}
+
+func TestManifestHasUndoableItems(t *testing.T) {
+	manifest := filepath.Join(t.TempDir(), "manifest.tsv")
+	header := "status\tsource\ttarget\tsize\tconflict\terror\n"
+	if err := os.WriteFile(manifest, []byte(header), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if ManifestHasUndoableItems(manifest) {
+		t.Fatal("header-only manifest must not enable undo")
+	}
+	row := "moved\tD:\\source.mp4\tD:\\target.mp4\t5\tfalse\t\n"
+	if err := os.WriteFile(manifest, []byte(header+row), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if !ManifestHasUndoableItems(manifest) {
+		t.Fatal("manifest with moved item must enable undo")
+	}
+	if ManifestHasUndoableItems(filepath.Join(t.TempDir(), "missing.tsv")) {
+		t.Fatal("missing manifest must not enable undo")
+	}
+}
 
 func TestExecuteMovePlanMovesFilesAndWritesManifest(t *testing.T) {
 	root := t.TempDir()
@@ -92,6 +194,29 @@ func TestPreviewEmptyDirsProtectsTarget(t *testing.T) {
 	}
 	if len(dirs) != 1 || dirs[0] != oldEmpty {
 		t.Fatalf("dirs = %v, want [%s]", dirs, oldEmpty)
+	}
+}
+
+func TestCleanupEmptyDirsProtectsExtendedPrefixTarget(t *testing.T) {
+	root := t.TempDir()
+	target := filepath.Join(root, "_Archived")
+	protectedEmpty := filepath.Join(target, "empty")
+	removableEmpty := filepath.Join(root, "old", "empty")
+	for _, dir := range []string{protectedEmpty, removableEmpty} {
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	removed, errs := CleanupEmptyDirs(context.Background(), root, []string{`\\?\` + target})
+	if len(errs) != 0 {
+		t.Fatalf("cleanup errors: %v", errs)
+	}
+	if removed != 2 {
+		t.Fatalf("removed = %d, want 2", removed)
+	}
+	if _, err := os.Stat(protectedEmpty); err != nil {
+		t.Fatalf("extended-prefix protected target was modified: %v", err)
 	}
 }
 

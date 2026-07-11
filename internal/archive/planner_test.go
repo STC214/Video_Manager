@@ -2,8 +2,10 @@ package archive
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -142,7 +144,7 @@ func TestExportMovePlanTSV(t *testing.T) {
 	}
 }
 
-func TestBuildMovePlanInsufficientCapacity(t *testing.T) {
+func TestBuildMovePlanAutoExpandsInsufficientCapacity(t *testing.T) {
 	files := []VideoFile{
 		{SourcePath: `D:\in\a.mp4`, Name: "a.mp4", Size: 1},
 		{SourcePath: `D:\in\b.mp4`, Name: "b.mp4", Size: 1},
@@ -156,10 +158,99 @@ func TestBuildMovePlanInsufficientCapacity(t *testing.T) {
 		FilesPerLeaf:    2,
 	})
 
-	if plan.ErrorCount != len(files) {
-		t.Fatalf("ErrorCount = %d, want %d", plan.ErrorCount, len(files))
+	if plan.ErrorCount != 0 {
+		t.Fatalf("ErrorCount = %d, want 0", plan.ErrorCount)
 	}
-	if plan.Items[0].Status != "error" {
-		t.Fatalf("Status = %q, want error", plan.Items[0].Status)
+	if !plan.AutoExpanded {
+		t.Fatal("expected plan capacity to auto-expand")
+	}
+	if plan.ConfiguredCapacity != 2 || plan.EffectiveCapacity != 4 {
+		t.Fatalf("capacities = configured %d, effective %d; want 2 and 4", plan.ConfiguredCapacity, plan.EffectiveCapacity)
+	}
+	if len(plan.EffectiveFolders) != 1 || plan.EffectiveFolders[0] != 2 {
+		t.Fatalf("EffectiveFolders = %v, want [2]", plan.EffectiveFolders)
+	}
+	if plan.Items[2].Status != "planned" || filepath.Base(filepath.Dir(plan.Items[2].TargetPath)) != "Episode_002" {
+		t.Fatalf("last item = %+v, want planned in Episode_002", plan.Items[2])
+	}
+}
+
+func TestBuildMovePlanAutoExpandsFirstLevelOnly(t *testing.T) {
+	files := make([]VideoFile, 294)
+	for i := range files {
+		files[i] = VideoFile{
+			SourcePath: filepath.Join(`D:\in`, fmt.Sprintf("%03d.mp4", i)),
+			Name:       fmt.Sprintf("%03d.mp4", i),
+			Size:       1,
+		}
+	}
+	plan := BuildMovePlan(files, PlanConfig{
+		TargetDir:       `D:\out`,
+		LevelCount:      2,
+		LevelNames:      []string{"Arc", "Season"},
+		FoldersPerLevel: []int{5, 5},
+		FilesPerLeaf:    10,
+	})
+	if plan.ErrorCount != 0 || !plan.AutoExpanded {
+		t.Fatalf("plan errors = %d, auto-expanded = %v", plan.ErrorCount, plan.AutoExpanded)
+	}
+	if got, want := plan.EffectiveFolders, []int{6, 5}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("EffectiveFolders = %v, want %v", got, want)
+	}
+	if plan.ConfiguredCapacity != 250 || plan.EffectiveCapacity != 300 {
+		t.Fatalf("capacities = configured %d, effective %d; want 250 and 300", plan.ConfiguredCapacity, plan.EffectiveCapacity)
+	}
+	if got := filepath.Dir(plan.Items[len(plan.Items)-1].TargetPath); got != filepath.Join(`D:\out`, "Arc_006", "Season_030") {
+		t.Fatalf("last target directory = %q", got)
+	}
+}
+
+func TestBuildMovePlanAutoExpansionPreservesTargetReadError(t *testing.T) {
+	target := t.TempDir()
+	blockedDir := filepath.Join(target, "Episode_001")
+	if err := os.WriteFile(blockedDir, []byte("not a directory"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	files := []VideoFile{
+		{SourcePath: `D:\in\a.mp4`, Name: "a.mp4", Size: 1},
+		{SourcePath: `D:\in\b.mp4`, Name: "b.mp4", Size: 1},
+		{SourcePath: `D:\in\c.mp4`, Name: "c.mp4", Size: 1},
+	}
+	plan := BuildMovePlan(files, PlanConfig{
+		TargetDir: target, LevelCount: 1, LevelNames: []string{"Episode"},
+		FoldersPerLevel: []int{1}, FilesPerLeaf: 2,
+	})
+	if !plan.AutoExpanded {
+		t.Fatal("expected capacity auto-expansion")
+	}
+	if plan.ErrorCount != 2 {
+		t.Fatalf("ErrorCount = %d, want 2", plan.ErrorCount)
+	}
+	if strings.Contains(plan.Items[0].Error, "capacity") || !strings.Contains(plan.Items[0].Error, "target directory check failed") {
+		t.Fatalf("unexpected plan error: %q", plan.Items[0].Error)
+	}
+	if plan.Items[2].Status != "planned" {
+		t.Fatalf("item in auto-expanded directory = %+v", plan.Items[2])
+	}
+}
+
+func TestBuildMovePlanRejectsFileInIntermediateTargetPath(t *testing.T) {
+	target := t.TempDir()
+	blockedAncestor := filepath.Join(target, "Arc_001")
+	if err := os.WriteFile(blockedAncestor, []byte("not a directory"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	plan := BuildMovePlan([]VideoFile{
+		{SourcePath: `D:\in\a.mp4`, Name: "a.mp4", Size: 1},
+	}, PlanConfig{
+		TargetDir: target, LevelCount: 2, LevelNames: []string{"Arc", "Season"},
+		FoldersPerLevel: []int{1, 1}, FilesPerLeaf: 1,
+	})
+	if plan.ErrorCount != 1 {
+		t.Fatalf("ErrorCount = %d, want 1", plan.ErrorCount)
+	}
+	if !strings.Contains(plan.Items[0].Error, "target path component is not a directory") ||
+		!strings.Contains(plan.Items[0].Error, "Arc_001") {
+		t.Fatalf("unexpected plan error: %q", plan.Items[0].Error)
 	}
 }

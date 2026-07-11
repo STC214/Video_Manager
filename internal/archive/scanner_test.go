@@ -69,3 +69,38 @@ func TestScanVideosHonorsPreCancelledContext(t *testing.T) {
 		t.Fatalf("cancelled scan returned %d files", len(result.Files))
 	}
 }
+
+func TestScanVideosExcludesExtendedPrefixTarget(t *testing.T) {
+	root := t.TempDir()
+	target := filepath.Join(root, "_Archived")
+	sourceVideo := filepath.Join(root, "source.mp4")
+	archivedVideo := filepath.Join(target, "Episode_001", "archived.mp4")
+	for _, path := range []string{sourceVideo, archivedVideo} {
+		if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte("video"), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	result := ScanVideos(context.Background(), root, []string{`\\?\` + target})
+	if result.ErrorCount != 0 || result.VideoCount != 1 || len(result.Files) != 1 || result.Files[0].SourcePath != sourceVideo {
+		t.Fatalf("scan result = %+v", result)
+	}
+}
+
+func TestNormalizeExcludedCanonicalizesExtendedPaths(t *testing.T) {
+	excluded := normalizeExcluded([]string{
+		`\\?\Z:\Videos\Archive`,
+		`\\?\UNC\server\share\Archive`,
+	})
+	for _, want := range []string{
+		`z:\videos\archive`,
+		`\\server\share\archive`,
+	} {
+		if _, ok := excluded[want]; !ok {
+			t.Fatalf("normalized exclusions %v do not contain %q", excluded, want)
+		}
+	}
+}

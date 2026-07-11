@@ -34,6 +34,15 @@ func displayPath(path string) string {
 	return path
 }
 
+func SamePath(left, right string) bool {
+	left = displayPath(left)
+	right = displayPath(right)
+	if left == "." || right == "." || left == "" || right == "" {
+		return false
+	}
+	return strings.EqualFold(filepath.Clean(left), filepath.Clean(right))
+}
+
 func IsLikelyNetworkPath(path string) bool {
 	path = strings.TrimSpace(path)
 	if path == "" {

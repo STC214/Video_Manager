@@ -48,16 +48,17 @@ const (
 	idLevelNameBase   = 1100
 	idLevelFolderBase = 1200
 
-	wmScanComplete = win.WM_APP + 1
-	wmMoveProgress = win.WM_APP + 2
-	wmMoveComplete = win.WM_APP + 3
-	wmUndoComplete = win.WM_APP + 4
-	wmScanProgress = win.WM_APP + 5
-	wmDryRunDone   = win.WM_APP + 6
-	wmAppInit      = win.WM_APP + 7
-	wmConfigLoaded = win.WM_APP + 8
-	wmCloseReady   = win.WM_APP + 9
-	maxLevels      = 5
+	wmScanComplete   = win.WM_APP + 1
+	wmMoveProgress   = win.WM_APP + 2
+	wmMoveComplete   = win.WM_APP + 3
+	wmUndoComplete   = win.WM_APP + 4
+	wmScanProgress   = win.WM_APP + 5
+	wmDryRunDone     = win.WM_APP + 6
+	wmAppInit        = win.WM_APP + 7
+	wmConfigLoaded   = win.WM_APP + 8
+	wmCloseReady     = win.WM_APP + 9
+	wmDryRunProgress = win.WM_APP + 10
+	maxLevels        = 5
 
 	bifReturnOnlyFSDirs = 0x0001
 	bifNewDialogStyle   = 0x0040
@@ -111,41 +112,46 @@ type app struct {
 	controls  map[int]win.HWND
 	levelRows []levelRow
 
-	mu                sync.Mutex
-	scanResult        archive.ScanResult
-	currentPlan       archive.MovePlan
-	currentPlanConfig archive.PlanConfig
-	moveSummary       archive.MoveSummary
-	undoSummary       archive.UndoSummary
-	moveStatus        string
-	moveDone          int
-	moveTotal         int
-	moveCancel        context.CancelFunc
-	scanCancel        context.CancelFunc
-	scanStatus        string
-	dryRunCancel      context.CancelFunc
-	dryRunPreview     string
-	dryRunTSV         string
-	dryRunError       string
-	dryRunLines       []string
-	dryRunPage        int
-	progressTotal     int
-	progressBusy      bool
-	lastManifest      string
-	scanning          bool
-	dryRunning        bool
-	moving            bool
-	initializing      bool
-	logCh             chan string
-	logOnce           sync.Once
-	configWriteMu     sync.Mutex
-	configSequence    uint64
-	configWritten     uint64
-	pendingConfig     appconfig.Config
-	configLoadErr     error
-	configEdited      bool
-	closing           bool
-	closeSaveStarted  bool
+	mu                       sync.Mutex
+	scanResult               archive.ScanResult
+	currentPlan              archive.MovePlan
+	currentPlanConfig        archive.PlanConfig
+	moveSummary              archive.MoveSummary
+	undoSummary              archive.UndoSummary
+	moveStatus               string
+	moveDone                 int
+	moveTotal                int
+	moveCancel               context.CancelFunc
+	scanCancel               context.CancelFunc
+	scanStatus               string
+	dryRunCancel             context.CancelFunc
+	dryRunPreview            string
+	dryRunTSV                string
+	dryRunError              string
+	dryRunLines              []string
+	dryRunPage               int
+	dryRunProgressDone       int
+	dryRunProgressTotal      int
+	dryRunProgressStatus     string
+	progressTotal            int
+	progressBusy             bool
+	lastManifest             string
+	lastManifestAvailable    bool
+	scanning                 bool
+	dryRunning               bool
+	moving                   bool
+	initializing             bool
+	logCh                    chan string
+	logOnce                  sync.Once
+	configWriteMu            sync.Mutex
+	configSequence           uint64
+	configWritten            uint64
+	pendingConfig            appconfig.Config
+	pendingManifestAvailable bool
+	configLoadErr            error
+	configEdited             bool
+	closing                  bool
+	closeSaveStarted         bool
 }
 
 type levelRow struct {
@@ -294,8 +300,10 @@ func wndProc(hwnd win.HWND, msg uint32, wParam, lParam uintptr) uintptr {
 			startupTrace("APP_INIT: recalculate done")
 			go func() {
 				cfg, err := appconfig.Load()
+				manifestAvailable := err == nil && archive.ManifestHasUndoableItems(cfg.LastManifest)
 				a.mu.Lock()
 				a.pendingConfig = cfg
+				a.pendingManifestAvailable = manifestAvailable
 				a.configLoadErr = err
 				a.mu.Unlock()
 				win.PostMessage(a.hwnd, wmConfigLoaded, 0, 0)
@@ -331,6 +339,10 @@ func wndProc(hwnd win.HWND, msg uint32, wParam, lParam uintptr) uintptr {
 	case wmDryRunDone:
 		if a != nil {
 			a.finishDryRun()
+		}
+	case wmDryRunProgress:
+		if a != nil {
+			a.showDryRunProgress()
 		}
 	case wmMoveProgress:
 		if a != nil {
@@ -563,7 +575,7 @@ func shouldFollowSourceTarget(oldSource, oldTarget string) bool {
 		return false
 	}
 	expected := filepath.Join(oldSource, "_Archived")
-	return strings.EqualFold(filepath.Clean(oldTarget), filepath.Clean(expected))
+	return archive.SamePath(oldTarget, expected)
 }
 
 func (a *app) invalidatePathDependentState() {
@@ -579,10 +591,10 @@ func (a *app) invalidatePathDependentState() {
 	a.dryRunLines = nil
 	a.dryRunTSV = ""
 	a.dryRunError = ""
-	hasManifest := a.lastManifest != ""
+	hasManifest := a.lastManifestAvailable
 	a.mu.Unlock()
 
-	a.setText(a.controls[idPreview], "路径已变化，请重新扫描并生成 Dry-run。")
+	a.setTextNoFlicker(a.controls[idPreview], "路径已变化，请重新扫描并生成 Dry-run。")
 	a.setActionState(true, false, false, false, hasManifest)
 }
 
@@ -603,15 +615,15 @@ func (a *app) invalidatePlanForConfigurationChange() {
 	a.currentPlan = archive.MovePlan{}
 	a.currentPlanConfig = archive.PlanConfig{}
 	hasScan := len(a.scanResult.Files) > 0
-	hasManifest := a.lastManifest != ""
+	hasManifest := a.lastManifestAvailable
 	a.mu.Unlock()
 
-	a.setText(a.controls[idPreview], "归档结构配置已变化，请重新生成 Dry-run。")
+	a.setTextNoFlicker(a.controls[idPreview], "归档结构配置已变化，请重新生成 Dry-run。")
 	a.setActionState(true, hasScan, false, false, hasManifest)
 }
 
 func samePlanConfig(left, right archive.PlanConfig) bool {
-	if !strings.EqualFold(filepath.Clean(strings.TrimSpace(left.TargetDir)), filepath.Clean(strings.TrimSpace(right.TargetDir))) ||
+	if !archive.SamePath(left.TargetDir, right.TargetDir) ||
 		left.LevelCount != right.LevelCount || left.FilesPerLeaf != right.FilesPerLeaf ||
 		len(left.LevelNames) != len(right.LevelNames) || len(left.FoldersPerLevel) != len(right.FoldersPerLevel) {
 		return false
@@ -630,8 +642,8 @@ func samePlanConfig(left, right archive.PlanConfig) bool {
 }
 
 func isConfigurationCommand(id, code int) bool {
-	if id == idBrowse || id == idBrowseTarget || id == idPreset {
-		return true
+	if id == idPreset {
+		return code == win.CBN_SELCHANGE
 	}
 	if code != win.EN_CHANGE {
 		return false
@@ -675,13 +687,22 @@ func (a *app) startScan() {
 		cancel()
 		return
 	}
+	if target != "" && archive.SamePath(source, target) {
+		a.log("源目录和目标目录不能相同，请重新选择目标目录。")
+		a.mu.Lock()
+		a.scanning = false
+		a.scanCancel = nil
+		a.mu.Unlock()
+		cancel()
+		return
+	}
 	a.log("开始扫描: " + source)
 	if archive.IsLikelyNetworkPath(source) {
 		a.log("检测到网络路径，扫描和访问校验会给予更长等待时间。")
 	}
 	a.setConfigurationEnabled(false)
 	a.setActionState(false, false, false, true, false)
-	a.setProgressBusy(true)
+	a.setProgress(0, 4)
 
 	go func() {
 		if err := archive.CheckReadableDirContext(ctx, source); err != nil {
@@ -726,7 +747,7 @@ func (a *app) finishScan() {
 	defer a.maybeFinishClose()
 	a.mu.Lock()
 	result := a.scanResult
-	hasManifest := a.lastManifest != ""
+	hasManifest := a.lastManifestAvailable
 	a.mu.Unlock()
 	a.setConfigurationEnabled(true)
 	a.setActionState(true, len(result.Files) > 0, false, false, hasManifest)
@@ -751,7 +772,7 @@ func (a *app) finishScan() {
 	a.recalculate()
 	if len(result.Files) == 0 && !result.Cancelled {
 		a.log("当前源目录未扫描到视频，无法生成 Dry-run: " + result.SourceDir)
-		a.setText(a.controls[idPreview], "未扫描到视频。\r\n\r\n当前源目录："+result.SourceDir+"\r\n\r\n请选择包含视频的源目录后重新扫描。")
+		a.setTextNoFlicker(a.controls[idPreview], "未扫描到视频。\r\n\r\n当前源目录："+result.SourceDir+"\r\n\r\n请选择包含视频的源目录后重新扫描。")
 	}
 }
 
@@ -774,6 +795,11 @@ func (a *app) generateDryRun() {
 	if strings.TrimSpace(a.text(a.controls[idTargetEdit])) == "" {
 		cancel()
 		a.log("请先选择或输入目标目录。")
+		return
+	}
+	if archive.SamePath(a.text(a.controls[idSourceEdit]), a.text(a.controls[idTargetEdit])) {
+		cancel()
+		a.log("源目录和目标目录不能相同，无法生成 Dry-run。")
 		return
 	}
 
@@ -813,17 +839,36 @@ func (a *app) generateDryRun() {
 			win.PostMessage(a.hwnd, wmDryRunDone, 0, 0)
 			return
 		}
+		a.postDryRunProgress(1, 4, "Dry-run 进度 1/4: 目标目录校验完成。")
 		plan := archive.BuildMovePlanContext(ctx, result.Files, cfg)
+		a.postDryRunProgress(2, 4, "Dry-run 进度 2/4: 移动计划生成完成。")
 		lines := []string{
 			fmt.Sprintf("Dry-run: %d 个文件, 目标目录 %d 个, 重名冲突 %d 个, 错误 %d 个",
 				len(plan.Items), plan.TargetDirCount, plan.ConflictCount, plan.ErrorCount),
 			"排序规则: 文件最后修改时间从早到晚，越早的文件进入编号越小的叶目录。",
 			"",
 		}
+		if plan.AutoExpanded {
+			lines = append(lines,
+				fmt.Sprintf("自动扩容: 原配置最多容纳 %d 个文件，规划时已将第 1 层目录数扩展为 %d，实际容量 %d。",
+					plan.ConfiguredCapacity, plan.EffectiveFolders[0], plan.EffectiveCapacity),
+				"每叶目录文件数保持不变；容量不足不会阻止正式移动。",
+				"")
+		}
+		if plan.ErrorCount > 0 {
+			lines = append(lines, "计划错误明细:")
+			lines = append(lines, planErrorMessages(plan, 20)...)
+			lines = append(lines, "")
+		}
 		for i := 0; i < len(plan.Items); i++ {
 			item := plan.Items[i]
-			lines = append(lines, item.SourcePath+" -> "+item.TargetPath)
+			if item.Error != "" {
+				lines = append(lines, "ERROR: "+item.SourcePath+" -> "+item.TargetPath+" | "+item.Error)
+			} else {
+				lines = append(lines, item.SourcePath+" -> "+item.TargetPath)
+			}
 		}
+		a.postDryRunProgress(3, 4, "Dry-run 进度 3/4: 空目录预览完成。")
 		if sourceRoot != "" && ctx.Err() == nil {
 			dirs, errs := archive.PreviewEmptyDirs(ctx, sourceRoot, []string{targetRoot})
 			lines = append(lines, "", fmt.Sprintf("计划清理空目录: %d 个，预览错误 %d 个", len(dirs), len(errs)))
@@ -837,6 +882,9 @@ func (a *app) generateDryRun() {
 			if len(dirs) > cleanupLimit {
 				lines = append(lines, fmt.Sprintf("... 还有 %d 个空目录未显示", len(dirs)-cleanupLimit))
 			}
+		}
+		if ctx.Err() == nil {
+			a.postDryRunProgress(4, 4, "Dry-run 进度 4/4: TSV 导出完成。")
 		}
 
 		tsvPath := ""
@@ -881,7 +929,7 @@ func (a *app) finishDryRun() {
 	errText := a.dryRunError
 	itemCount := len(a.currentPlan.Items)
 	planErrors := a.currentPlan.ErrorCount
-	hasManifest := a.lastManifest != ""
+	hasManifest := a.lastManifestAvailable
 	a.mu.Unlock()
 	a.setConfigurationEnabled(true)
 	a.setActionState(true, true, errText == "" && itemCount > 0 && planErrors == 0, false, hasManifest)
@@ -889,16 +937,79 @@ func (a *app) finishDryRun() {
 	if len(lines) > 0 {
 		a.setDryRunPreviewPage(lines, 0)
 	} else if preview != "" {
-		a.setText(a.controls[idPreview], preview)
+		a.setTextNoFlicker(a.controls[idPreview], preview)
 	}
 	if errText != "" {
 		a.log(errText)
 		return
 	}
+	if planErrors > 0 {
+		a.mu.Lock()
+		plan := a.currentPlan
+		a.mu.Unlock()
+		messages := planErrorMessages(plan, 1)
+		firstError := "未知错误"
+		if len(messages) > 0 {
+			firstError = messages[0]
+		}
+		a.log(fmt.Sprintf("Dry-run 存在 %d 个错误项，开始移动保持禁用；首个错误: %s", planErrors, firstError))
+		return
+	}
+	a.mu.Lock()
+	plan := a.currentPlan
+	a.mu.Unlock()
+	if plan.AutoExpanded {
+		a.log(fmt.Sprintf("Dry-run 已自动扩容: 原容量 %d，实际容量 %d，第 1 层目录数 %d。",
+			plan.ConfiguredCapacity, plan.EffectiveCapacity, plan.EffectiveFolders[0]))
+	}
 	a.log(fmt.Sprintf("Dry-run 已生成: %d 个移动项。", itemCount))
 	if tsvPath != "" {
 		a.log("Dry-run TSV: " + tsvPath)
 	}
+}
+
+func (a *app) postDryRunProgress(done, total int, status string) {
+	a.mu.Lock()
+	a.dryRunProgressDone = done
+	a.dryRunProgressTotal = total
+	a.dryRunProgressStatus = status
+	a.mu.Unlock()
+	win.PostMessage(a.hwnd, wmDryRunProgress, 0, 0)
+}
+
+func (a *app) showDryRunProgress() {
+	a.mu.Lock()
+	done := a.dryRunProgressDone
+	total := a.dryRunProgressTotal
+	status := a.dryRunProgressStatus
+	a.mu.Unlock()
+	a.setProgress(done, total)
+	if status != "" {
+		a.log(status)
+	}
+}
+
+func planErrorMessages(plan archive.MovePlan, limit int) []string {
+	if limit <= 0 {
+		return nil
+	}
+	seen := make(map[string]struct{})
+	messages := make([]string, 0, min(limit, plan.ErrorCount))
+	for _, item := range plan.Items {
+		message := strings.TrimSpace(item.Error)
+		if message == "" {
+			continue
+		}
+		if _, exists := seen[message]; exists {
+			continue
+		}
+		seen[message] = struct{}{}
+		messages = append(messages, message)
+		if len(messages) == limit {
+			break
+		}
+	}
+	return messages
 }
 
 const dryRunPreviewPageSize = 200
@@ -916,7 +1027,7 @@ func (a *app) changeDryRunPage(delta int) {
 
 func (a *app) setDryRunPreviewPage(lines []string, page int) {
 	if len(lines) == 0 {
-		a.setText(a.controls[idPreview], "")
+		a.setTextNoFlicker(a.controls[idPreview], "")
 		return
 	}
 	pages := (len(lines) + dryRunPreviewPageSize - 1) / dryRunPreviewPageSize
@@ -927,7 +1038,7 @@ func (a *app) setDryRunPreviewPage(lines []string, page int) {
 		end = len(lines)
 	}
 	header := fmt.Sprintf("Dry-run 预览第 %d/%d 页，每页最多 %d 行。完整明细请看 TSV。\r\n\r\n", page+1, pages, dryRunPreviewPageSize)
-	a.setText(a.controls[idPreview], header+strings.Join(lines[start:end], "\r\n"))
+	a.setTextNoFlicker(a.controls[idPreview], header+strings.Join(lines[start:end], "\r\n"))
 	a.mu.Lock()
 	a.dryRunPage = page
 	a.dryRunPreview = ""
@@ -1121,21 +1232,33 @@ func (a *app) finishMove() {
 	summary := a.moveSummary
 	a.currentPlan = archive.MovePlan{}
 	a.currentPlanConfig = archive.PlanConfig{}
+	lastManifest, newManifest := manifestAfterMove(a.lastManifest, summary)
+	a.lastManifest = lastManifest
+	if newManifest {
+		a.lastManifestAvailable = true
+	}
+	hasManifest := a.lastManifestAvailable
 	a.mu.Unlock()
 	a.setConfigurationEnabled(true)
-	a.setActionState(true, false, false, false, summary.ManifestPath != "" && summary.Moved > 0)
+	a.setActionState(true, false, false, false, hasManifest)
 	a.setProgress(summary.Moved+summary.Failed, summary.Total)
 	a.log(fmt.Sprintf("移动完成: 总数 %d, 成功 %d, 失败 %d, 已取消 %s", summary.Total, summary.Moved, summary.Failed, yesNo(summary.Cancelled)))
 	if summary.Error != "" {
 		a.log("移动安全检查错误: " + summary.Error)
 	}
-	if summary.ManifestPath != "" {
-		a.mu.Lock()
-		a.lastManifest = summary.ManifestPath
-		a.mu.Unlock()
+	if newManifest {
 		a.saveConfigAsync()
 		a.log("运行清单: " + summary.ManifestPath)
+	} else if summary.ManifestPath != "" {
+		a.log("本次未成功移动文件，运行清单仅用于诊断，不会设为最近可撤销清单: " + summary.ManifestPath)
 	}
+}
+
+func manifestAfterMove(existing string, summary archive.MoveSummary) (string, bool) {
+	if summary.ManifestPath != "" && summary.Moved > 0 {
+		return summary.ManifestPath, true
+	}
+	return existing, false
 }
 
 func (a *app) startUndo() {
@@ -1210,8 +1333,9 @@ func (a *app) finishUndo() {
 	summary := a.undoSummary
 	if summary.Total > 0 && summary.Restored == summary.Total && summary.Failed == 0 && !summary.Cancelled {
 		a.lastManifest = ""
+		a.lastManifestAvailable = false
 	}
-	hasPendingUndo := a.lastManifest != ""
+	hasPendingUndo := a.lastManifestAvailable
 	a.mu.Unlock()
 	a.setConfigurationEnabled(true)
 	a.setActionState(true, false, false, false, hasPendingUndo)
@@ -1246,10 +1370,10 @@ func (a *app) recalculate() {
 		yesNo(result.Enough),
 	)
 	if !result.Enough {
-		resultText += fmt.Sprintf("\r\n还差叶目录数量: %d\r\n还差可容纳文件数: %d", result.MissingLeafDirs, result.MissingCapacity)
+		resultText += fmt.Sprintf("\r\n还差叶目录数量: %d\r\n还差可容纳文件数: %d\r\nDry-run 将自动增加第 1 层目录数量，不会仅因容量不足阻止移动。", result.MissingLeafDirs, result.MissingCapacity)
 	}
 	a.setText(a.controls[idResult], resultText)
-	a.setText(a.controls[idPreview], strings.Join(result.PreviewPaths, "\r\n"))
+	a.setTextNoFlicker(a.controls[idPreview], strings.Join(result.PreviewPaths, "\r\n"))
 	a.updateLevelVisibility()
 }
 
@@ -1269,6 +1393,7 @@ func (a *app) applyPreset(index int) {
 func (a *app) finishConfigLoad() {
 	a.mu.Lock()
 	cfg := a.pendingConfig
+	manifestAvailable := a.pendingManifestAvailable
 	err := a.configLoadErr
 	a.mu.Unlock()
 	startupTrace("APP_INIT: config load done")
@@ -1276,12 +1401,12 @@ func (a *app) finishConfigLoad() {
 		return
 	}
 	a.initializing = true
-	a.applyConfig(cfg)
+	a.applyConfig(cfg, manifestAvailable)
 	a.initializing = false
 	a.recalculate()
 }
 
-func (a *app) applyConfig(cfg appconfig.Config) {
+func (a *app) applyConfig(cfg appconfig.Config, manifestAvailable bool) {
 	a.setText(a.controls[idSourceEdit], cfg.SourceDir)
 	a.setText(a.controls[idTargetEdit], cfg.TargetDir)
 	if cfg.LevelCount > 0 {
@@ -1294,7 +1419,8 @@ func (a *app) applyConfig(cfg appconfig.Config) {
 		win.SendMessage(a.controls[idPreset], win.CB_SETCURSEL, uintptr(cfg.PresetIndex), 0)
 	}
 	a.lastManifest = cfg.LastManifest
-	win.EnableWindow(a.controls[idUndo], a.lastManifest != "")
+	a.lastManifestAvailable = manifestAvailable
+	win.EnableWindow(a.controls[idUndo], a.lastManifestAvailable)
 	for i := 0; i < len(cfg.LevelNames) && i < maxLevels; i++ {
 		a.setText(a.levelRows[i].nameEdit, cfg.LevelNames[i])
 	}
@@ -1552,6 +1678,16 @@ func (a *app) setText(hwnd win.HWND, text string) {
 	setWindowText(hwnd, text)
 }
 
+func (a *app) setTextNoFlicker(hwnd win.HWND, text string) {
+	if hwnd == 0 {
+		return
+	}
+	win.SendMessage(hwnd, win.WM_SETREDRAW, 0, 0)
+	setWindowText(hwnd, text)
+	win.SendMessage(hwnd, win.WM_SETREDRAW, 1, 0)
+	win.InvalidateRect(hwnd, nil, true)
+}
+
 func (a *app) intFromControl(hwnd win.HWND, fallback int) int {
 	value, err := strconv.Atoi(strings.TrimSpace(a.text(hwnd)))
 	if err != nil {
@@ -1574,16 +1710,22 @@ func (a *app) log(message string) {
 	if hwnd == 0 {
 		return
 	}
-	old := a.text(hwnd)
-	if old != "" {
-		old += "\r\n"
-	}
-	lines := strings.Split(old+message, "\r\n")
 	const maxLogLines = 200
-	if len(lines) > maxLogLines {
-		lines = lines[len(lines)-maxLogLines:]
+	a.setTextNoFlicker(hwnd, prependLogMessage(a.text(hwnd), message, maxLogLines))
+}
+
+func prependLogMessage(old, message string, limit int) string {
+	if limit <= 0 {
+		return ""
 	}
-	a.setText(hwnd, strings.Join(lines, "\r\n"))
+	lines := []string{message}
+	if old != "" {
+		lines = append(lines, strings.Split(old, "\r\n")...)
+	}
+	if len(lines) > limit {
+		lines = lines[:limit]
+	}
+	return strings.Join(lines, "\r\n")
 }
 
 func (a *app) runLogWriter() {

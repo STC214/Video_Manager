@@ -17,6 +17,14 @@ type UndoSummary struct {
 	Error     string
 }
 
+func ManifestHasUndoableItems(path string) bool {
+	if strings.TrimSpace(path) == "" {
+		return false
+	}
+	items, err := readManifestItems(path)
+	return err == nil && len(items) > 0
+}
+
 func UndoManifest(ctx context.Context, manifestPath string, onProgress func(MoveProgress)) UndoSummary {
 	summary := UndoSummary{}
 	items, err := readManifestItems(manifestPath)
