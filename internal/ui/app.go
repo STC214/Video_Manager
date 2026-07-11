@@ -130,9 +130,6 @@ type app struct {
 	dryRunError              string
 	dryRunLines              []string
 	dryRunPage               int
-	dryRunProgressDone       int
-	dryRunProgressTotal      int
-	dryRunProgressStatus     string
 	progressTotal            int
 	progressBusy             bool
 	lastManifest             string
@@ -342,7 +339,7 @@ func wndProc(hwnd win.HWND, msg uint32, wParam, lParam uintptr) uintptr {
 		}
 	case wmDryRunProgress:
 		if a != nil {
-			a.showDryRunProgress()
+			a.showDryRunProgress(int(wParam))
 		}
 	case wmMoveProgress:
 		if a != nil {
@@ -702,7 +699,7 @@ func (a *app) startScan() {
 	}
 	a.setConfigurationEnabled(false)
 	a.setActionState(false, false, false, true, false)
-	a.setProgress(0, 4)
+	a.setProgressBusy(true)
 
 	go func() {
 		if err := archive.CheckReadableDirContext(ctx, source); err != nil {
@@ -826,7 +823,8 @@ func (a *app) generateDryRun() {
 
 	a.setConfigurationEnabled(false)
 	a.setActionState(false, false, false, true, false)
-	a.setProgressBusy(true)
+	a.setProgress(0, 4)
+	a.setTextNoFlicker(a.controls[idPreview], "正在生成 Dry-run，请等待阶段进度完成……")
 	a.log("开始生成 Dry-run。")
 
 	go func() {
@@ -839,9 +837,11 @@ func (a *app) generateDryRun() {
 			win.PostMessage(a.hwnd, wmDryRunDone, 0, 0)
 			return
 		}
-		a.postDryRunProgress(1, 4, "Dry-run 进度 1/4: 目标目录校验完成。")
+		a.postDryRunProgress(1)
 		plan := archive.BuildMovePlanContext(ctx, result.Files, cfg)
-		a.postDryRunProgress(2, 4, "Dry-run 进度 2/4: 移动计划生成完成。")
+		if ctx.Err() == nil {
+			a.postDryRunProgress(2)
+		}
 		lines := []string{
 			fmt.Sprintf("Dry-run: %d 个文件, 目标目录 %d 个, 重名冲突 %d 个, 错误 %d 个",
 				len(plan.Items), plan.TargetDirCount, plan.ConflictCount, plan.ErrorCount),
@@ -868,7 +868,6 @@ func (a *app) generateDryRun() {
 				lines = append(lines, item.SourcePath+" -> "+item.TargetPath)
 			}
 		}
-		a.postDryRunProgress(3, 4, "Dry-run 进度 3/4: 空目录预览完成。")
 		if sourceRoot != "" && ctx.Err() == nil {
 			dirs, errs := archive.PreviewEmptyDirs(ctx, sourceRoot, []string{targetRoot})
 			lines = append(lines, "", fmt.Sprintf("计划清理空目录: %d 个，预览错误 %d 个", len(dirs), len(errs)))
@@ -884,7 +883,7 @@ func (a *app) generateDryRun() {
 			}
 		}
 		if ctx.Err() == nil {
-			a.postDryRunProgress(4, 4, "Dry-run 进度 4/4: TSV 导出完成。")
+			a.postDryRunProgress(3)
 		}
 
 		tsvPath := ""
@@ -899,6 +898,7 @@ func (a *app) generateDryRun() {
 				errText = "Dry-run TSV 导出失败: " + exportErr.Error()
 			} else {
 				tsvPath = path
+				a.postDryRunProgress(4)
 			}
 		}
 
@@ -919,9 +919,6 @@ func (a *app) generateDryRun() {
 
 func (a *app) finishDryRun() {
 	defer a.maybeFinishClose()
-	a.setProgressBusy(false)
-	a.setProgress(1, 1)
-
 	a.mu.Lock()
 	preview := a.dryRunPreview
 	lines := append([]string(nil), a.dryRunLines...)
@@ -940,6 +937,7 @@ func (a *app) finishDryRun() {
 		a.setTextNoFlicker(a.controls[idPreview], preview)
 	}
 	if errText != "" {
+		a.setTextNoFlicker(a.controls[idPreview], "Dry-run 未完成。\r\n\r\n"+errText)
 		a.log(errText)
 		return
 	}
@@ -968,24 +966,30 @@ func (a *app) finishDryRun() {
 	}
 }
 
-func (a *app) postDryRunProgress(done, total int, status string) {
-	a.mu.Lock()
-	a.dryRunProgressDone = done
-	a.dryRunProgressTotal = total
-	a.dryRunProgressStatus = status
-	a.mu.Unlock()
-	win.PostMessage(a.hwnd, wmDryRunProgress, 0, 0)
+func (a *app) postDryRunProgress(done int) {
+	win.PostMessage(a.hwnd, wmDryRunProgress, uintptr(done), 0)
 }
 
-func (a *app) showDryRunProgress() {
-	a.mu.Lock()
-	done := a.dryRunProgressDone
-	total := a.dryRunProgressTotal
-	status := a.dryRunProgressStatus
-	a.mu.Unlock()
-	a.setProgress(done, total)
+func (a *app) showDryRunProgress(done int) {
+	a.setProgress(done, 4)
+	status := dryRunProgressMessage(done)
 	if status != "" {
 		a.log(status)
+	}
+}
+
+func dryRunProgressMessage(done int) string {
+	switch done {
+	case 1:
+		return "Dry-run 进度 1/4: 目标目录校验完成。"
+	case 2:
+		return "Dry-run 进度 2/4: 移动计划生成完成。"
+	case 3:
+		return "Dry-run 进度 3/4: 空目录预览完成。"
+	case 4:
+		return "Dry-run 进度 4/4: TSV 导出完成。"
+	default:
+		return ""
 	}
 }
 

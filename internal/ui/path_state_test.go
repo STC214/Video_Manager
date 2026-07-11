@@ -118,3 +118,18 @@ func TestPrependLogMessageKeepsNewestFirst(t *testing.T) {
 		t.Fatalf("limited prependLogMessage() = %q", got)
 	}
 }
+
+func TestDryRunProgressMessagesMatchStages(t *testing.T) {
+	wants := []string{
+		"",
+		"Dry-run 进度 1/4: 目标目录校验完成。",
+		"Dry-run 进度 2/4: 移动计划生成完成。",
+		"Dry-run 进度 3/4: 空目录预览完成。",
+		"Dry-run 进度 4/4: TSV 导出完成。",
+	}
+	for done, want := range wants {
+		if got := dryRunProgressMessage(done); got != want {
+			t.Fatalf("dryRunProgressMessage(%d) = %q, want %q", done, got, want)
+		}
+	}
+}

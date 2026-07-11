@@ -11,8 +11,8 @@ func TestWindowTitle(t *testing.T) {
 		t.Fatalf("windowTitle() without version = %q", got)
 	}
 
-	BuildVersion = "202607_1035"
-	if got := windowTitle(); got != "Video Manager - 202607_1035" {
+	BuildVersion = "20260711_1035"
+	if got := windowTitle(); got != "Video Manager - 20260711_1035" {
 		t.Fatalf("windowTitle() with version = %q", got)
 	}
 }

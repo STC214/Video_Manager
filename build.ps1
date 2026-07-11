@@ -36,23 +36,25 @@ try {
     [void]$buildMutex.WaitOne()
     $buildMutexAcquired = $true
 
-    $buildVersion = Get-Date -Format "yyyyMM_HHmm"
-    if ($buildVersion -notmatch '^\d{6}_\d{4}$') {
+    $buildVersion = Get-Date -Format "yyyyMMdd_HHmm"
+    if ($buildVersion -notmatch '^\d{8}_\d{4}$') {
         throw "Unexpected build version format: $buildVersion"
     }
 
     $year = [int]$buildVersion.Substring(0, 4)
     $month = [int]$buildVersion.Substring(4, 2)
-    $hour = [int]$buildVersion.Substring(7, 2)
-    $minute = [int]$buildVersion.Substring(9, 2)
+    $day = [int]$buildVersion.Substring(6, 2)
+    $hour = [int]$buildVersion.Substring(9, 2)
+    $minute = [int]$buildVersion.Substring(11, 2)
+    $timeCode = $hour * 100 + $minute
     $resourceIconPath = $iconPath.Replace('\', '/')
 
     $resourceScript = @"
 1 ICON "$resourceIconPath"
 
 1 VERSIONINFO
-FILEVERSION $year,$month,$hour,$minute
-PRODUCTVERSION $year,$month,$hour,$minute
+FILEVERSION $year,$month,$day,$timeCode
+PRODUCTVERSION $year,$month,$day,$timeCode
 FILEFLAGSMASK 0x3fL
 FILEFLAGS 0x0L
 FILEOS 0x40004L
