@@ -530,7 +530,10 @@ func (a *app) handleCommand(wParam, lParam uintptr) {
 	case idPreset:
 		if code == win.CBN_SELCHANGE {
 			sel := int(win.SendMessage(a.controls[idPreset], win.CB_GETCURSEL, 0, 0))
+			wasInitializing := a.initializing
+			a.initializing = true
 			a.applyPreset(sel)
+			a.initializing = wasInitializing
 			a.recalculate()
 			a.invalidatePlanForConfigurationChange()
 		}
