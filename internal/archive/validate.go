@@ -79,27 +79,38 @@ func CheckTargetRootContext(ctx context.Context, path string) error {
 	if path == "" {
 		return fmt.Errorf("目标目录不能为空")
 	}
-	if targetInfo, err := os.Stat(fsPath(path)); err == nil {
+	var targetInfo os.FileInfo
+	targetErr := retryIOPaths(ctx, 3, []string{path}, func() error {
+		var err error
+		targetInfo, err = os.Stat(fsPath(path))
+		return err
+	})
+	if targetErr == nil {
 		if !targetInfo.IsDir() {
 			return fmt.Errorf("目标路径已存在但不是目录")
 		}
-		return CheckReadableDirContext(ctx, path)
+		return CheckReadableDirForReadContext(ctx, path)
 	}
-	var lastErr error
-	for parent := filepath.Dir(filepath.Clean(path)); parent != "." && parent != path; parent = filepath.Dir(parent) {
-		info, err := os.Stat(fsPath(parent))
-		if err != nil && IsLikelyNetworkPath(parent) && filepath.Dir(parent) == parent {
-			err = retryIOPaths(ctx, 3, []string{parent}, func() error {
-				var statErr error
-				info, statErr = os.Stat(fsPath(parent))
-				return statErr
-			})
-		}
+	if !os.IsNotExist(targetErr) {
+		return targetErr
+	}
+
+	lastErr := targetErr
+	for parent := filepath.Dir(filepath.Clean(path)); ; parent = filepath.Dir(parent) {
+		var info os.FileInfo
+		err := retryIOPaths(ctx, 3, []string{parent}, func() error {
+			var statErr error
+			info, statErr = os.Stat(fsPath(parent))
+			return statErr
+		})
 		if err == nil {
 			if !info.IsDir() {
 				return fmt.Errorf("可用上级路径不是目录: %s", parent)
 			}
-			return CheckReadableDirContext(ctx, parent)
+			return CheckReadableDirForReadContext(ctx, parent)
+		}
+		if !os.IsNotExist(err) {
+			return err
 		}
 		lastErr = err
 		next := filepath.Dir(parent)

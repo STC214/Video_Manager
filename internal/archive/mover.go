@@ -63,13 +63,13 @@ func ExecuteMovePlan(ctx context.Context, plan MovePlan, opts MoveOptions, onPro
 		return summary
 	}
 	writer := bufio.NewWriter(manifest)
-	if _, err := fmt.Fprintln(writer, "status\tsource\ttarget\tsize\tconflict\terror"); err != nil {
+	if _, err := fmt.Fprintln(writer, "status\tsource\ttarget\tsize\tconflict\terror\tmod_time_rfc3339_nano"); err != nil {
 		_ = manifest.Close()
 		summary.Failed = summary.Total
 		summary.Error = "cannot initialize manifest: " + err.Error()
 		return summary
 	}
-	if err := writer.Flush(); err != nil {
+	if err := flushAndSyncManifest(writer, manifest); err != nil {
 		_ = manifest.Close()
 		summary.Failed = summary.Total
 		summary.Error = "cannot initialize manifest: " + err.Error()
@@ -90,6 +90,16 @@ func ExecuteMovePlan(ctx context.Context, plan MovePlan, opts MoveOptions, onPro
 				TargetPath: item.TargetPath,
 				Status:     "processing",
 			})
+		}
+		if err := writeManifest(writer, "pending", item); err != nil {
+			summary.Error = "cannot write move intent: " + err.Error()
+			summary.Failed += len(plan.Items) - i
+			break
+		}
+		if err := flushAndSyncManifest(writer, manifest); err != nil {
+			summary.Error = "cannot persist move intent: " + err.Error()
+			summary.Failed += len(plan.Items) - i
+			break
 		}
 
 		capacityErr := checkTargetCapacity(ctx, item.TargetPath, plan.TargetDirFileLimit, plan.ManagedExtensions)
@@ -116,8 +126,8 @@ func ExecuteMovePlan(ctx context.Context, plan MovePlan, opts MoveOptions, onPro
 			summary.Failed += len(plan.Items) - i - 1
 			break
 		}
-		if err := writer.Flush(); err != nil {
-			summary.Error = "manifest flush failed after file operation: " + err.Error()
+		if err := flushAndSyncManifest(writer, manifest); err != nil {
+			summary.Error = "manifest persistence failed after file operation: " + err.Error()
 			summary.Failed += len(plan.Items) - i - 1
 			break
 		}
@@ -131,20 +141,35 @@ func ExecuteMovePlan(ctx context.Context, plan MovePlan, opts MoveOptions, onPro
 				Error:      item.Error,
 			})
 		}
+		if moveErr != nil && plan.StopOnError {
+			summary.Error = "move plan stopped after an item failed: " + moveErr.Error()
+			summary.Failed += len(plan.Items) - i - 1
+			break
+		}
 		if capacityErr != nil {
 			summary.Error = capacityErr.Error()
 			summary.Failed += len(plan.Items) - i - 1
 			break
 		}
 	}
-	if err := writer.Flush(); err != nil && summary.Error == "" {
-		summary.Error = "manifest final flush failed: " + err.Error()
+	if err := flushAndSyncManifest(writer, manifest); err != nil && summary.Error == "" {
+		summary.Error = "manifest final persistence failed: " + err.Error()
 	}
 	if err := manifest.Close(); err != nil && summary.Error == "" {
 		summary.Error = "manifest close failed: " + err.Error()
 	}
 
 	return summary
+}
+
+func flushAndSyncManifest(writer *bufio.Writer, manifest *os.File) error {
+	if writer == nil || manifest == nil {
+		return fmt.Errorf("manifest writer is unavailable")
+	}
+	if err := writer.Flush(); err != nil {
+		return err
+	}
+	return retryIOPaths(context.Background(), 3, []string{manifest.Name()}, manifest.Sync)
 }
 
 func checkTargetCapacity(ctx context.Context, targetPath string, limit int, extensions []string) error {
@@ -202,7 +227,12 @@ func moveOne(ctx context.Context, item MovePlanItem) (string, error) {
 		return "error", fmt.Errorf("source or target path is empty")
 	}
 
-	sourceInfo, err := os.Stat(fsPath(item.SourcePath))
+	var sourceInfo os.FileInfo
+	err := retryIOPathsWithMissing(ctx, 3, []string{item.SourcePath}, true, func() error {
+		var statErr error
+		sourceInfo, statErr = os.Stat(fsPath(item.SourcePath))
+		return statErr
+	})
 	if err != nil {
 		return "error", err
 	}
@@ -219,7 +249,7 @@ func moveOne(ctx context.Context, item MovePlanItem) (string, error) {
 		return "error", err
 	}
 
-	if err := retryIOPaths(ctx, 2, []string{item.SourcePath, item.TargetPath}, func() error {
+	if err := retryIOPathsWithMissing(ctx, 2, []string{item.SourcePath, item.TargetPath}, true, func() error {
 		return os.Rename(fsPath(item.SourcePath), fsPath(item.TargetPath))
 	}); err == nil {
 		return "moved", nil
@@ -236,12 +266,17 @@ func copyVerifyDelete(ctx context.Context, sourcePath, targetPath string, source
 }
 
 func copyVerifyDeleteWithHooks(ctx context.Context, sourcePath, targetPath string, sourceInfo os.FileInfo, afterCopy func(), setTimes func(string, time.Time, time.Time) error) error {
-	source, err := os.Open(fsPath(sourcePath))
+	var source *os.File
+	err := retryIOPathsWithMissing(ctx, 3, []string{sourcePath}, true, func() error {
+		var openErr error
+		source, openErr = os.Open(fsPath(sourcePath))
+		return openErr
+	})
 	if err != nil {
 		return err
 	}
 	var target *os.File
-	err = retryIOPaths(ctx, 3, []string{sourcePath, targetPath}, func() error {
+	err = retryIOPathsWithMissing(ctx, 3, []string{sourcePath, targetPath}, true, func() error {
 		var openErr error
 		target, openErr = os.OpenFile(fsPath(targetPath), os.O_CREATE|os.O_WRONLY|os.O_EXCL, sourceInfo.Mode())
 		return openErr
@@ -251,11 +286,16 @@ func copyVerifyDeleteWithHooks(ctx context.Context, sourcePath, targetPath strin
 		return err
 	}
 	_, copyErr := copyWithContext(ctx, target, source)
+	syncErr := retryIOPaths(ctx, 3, []string{targetPath}, target.Sync)
 	sourceCloseErr := source.Close()
 	closeErr := target.Close()
 	if copyErr != nil {
 		_ = os.Remove(fsPath(targetPath))
 		return copyErr
+	}
+	if syncErr != nil {
+		_ = os.Remove(fsPath(targetPath))
+		return syncErr
 	}
 	if closeErr != nil {
 		_ = os.Remove(fsPath(targetPath))
@@ -269,7 +309,12 @@ func copyVerifyDeleteWithHooks(ctx context.Context, sourcePath, targetPath strin
 		afterCopy()
 	}
 
-	targetInfo, err := os.Stat(fsPath(targetPath))
+	var targetInfo os.FileInfo
+	err = retryIOPathsWithMissing(ctx, 3, []string{targetPath}, true, func() error {
+		var statErr error
+		targetInfo, statErr = os.Stat(fsPath(targetPath))
+		return statErr
+	})
 	if err != nil {
 		_ = os.Remove(fsPath(targetPath))
 		return err
@@ -278,7 +323,12 @@ func copyVerifyDeleteWithHooks(ctx context.Context, sourcePath, targetPath strin
 		_ = os.Remove(fsPath(targetPath))
 		return fmt.Errorf("copy verify failed: source size %d, target size %d", sourceInfo.Size(), targetInfo.Size())
 	}
-	currentSourceInfo, err := os.Stat(fsPath(sourcePath))
+	var currentSourceInfo os.FileInfo
+	err = retryIOPathsWithMissing(ctx, 3, []string{sourcePath}, true, func() error {
+		var statErr error
+		currentSourceInfo, statErr = os.Stat(fsPath(sourcePath))
+		return statErr
+	})
 	if err != nil {
 		_ = os.Remove(fsPath(targetPath))
 		return fmt.Errorf("source revalidation after copy failed: %w", err)
@@ -288,12 +338,48 @@ func copyVerifyDeleteWithHooks(ctx context.Context, sourcePath, targetPath strin
 		return fmt.Errorf("source file changed during copy: size %d -> %d, modification time %s -> %s",
 			sourceInfo.Size(), currentSourceInfo.Size(), sourceInfo.ModTime().Format(time.RFC3339Nano), currentSourceInfo.ModTime().Format(time.RFC3339Nano))
 	}
-	if err := setTimes(fsPath(targetPath), sourceInfo.ModTime(), sourceInfo.ModTime()); err != nil {
+	if err := retryIOPathsWithMissing(ctx, 3, []string{targetPath}, true, func() error {
+		return setTimes(fsPath(targetPath), sourceInfo.ModTime(), sourceInfo.ModTime())
+	}); err != nil {
 		_ = os.Remove(fsPath(targetPath))
 		return fmt.Errorf("cannot preserve target modification time: %w", err)
 	}
-	return retryIOPaths(ctx, 3, []string{sourcePath}, func() error {
+	var finalTargetInfo os.FileInfo
+	if err := retryIOPathsWithMissing(ctx, 3, []string{targetPath}, true, func() error {
+		var statErr error
+		finalTargetInfo, statErr = os.Stat(fsPath(targetPath))
+		return statErr
+	}); err != nil {
+		_ = os.Remove(fsPath(targetPath))
+		return fmt.Errorf("cannot verify preserved target metadata: %w", err)
+	}
+	if finalTargetInfo.Size() != sourceInfo.Size() || !finalTargetInfo.ModTime().Equal(sourceInfo.ModTime()) {
+		_ = os.Remove(fsPath(targetPath))
+		return fmt.Errorf("target metadata preservation failed: size %d, time %s; want size %d, time %s",
+			finalTargetInfo.Size(), finalTargetInfo.ModTime().Format(time.RFC3339Nano),
+			sourceInfo.Size(), sourceInfo.ModTime().Format(time.RFC3339Nano))
+	}
+	if err := syncExistingFile(ctx, targetPath); err != nil {
+		_ = os.Remove(fsPath(targetPath))
+		return fmt.Errorf("cannot persist preserved target metadata: %w", err)
+	}
+	return retryIOPathsWithMissing(ctx, 3, []string{sourcePath}, true, func() error {
 		return os.Remove(fsPath(sourcePath))
+	})
+}
+
+func syncExistingFile(ctx context.Context, path string) error {
+	return retryIOPathsWithMissing(ctx, 3, []string{path}, true, func() error {
+		file, err := os.OpenFile(fsPath(path), os.O_RDWR, 0)
+		if err != nil {
+			return err
+		}
+		syncErr := file.Sync()
+		closeErr := file.Close()
+		if syncErr != nil {
+			return syncErr
+		}
+		return closeErr
 	})
 }
 
@@ -333,15 +419,23 @@ func writeManifest(writer *bufio.Writer, status string, item MovePlanItem) error
 	if writer == nil {
 		return fmt.Errorf("manifest writer is unavailable")
 	}
-	_, err := fmt.Fprintf(writer, "%s\t%s\t%s\t%d\t%t\t%s\n",
+	_, err := fmt.Fprintf(writer, "%s\t%s\t%s\t%d\t%t\t%s\t%s\n",
 		status,
 		escapeTSV(item.SourcePath),
 		escapeTSV(item.TargetPath),
 		item.Size,
 		item.Conflict,
 		escapeTSV(item.Error),
+		manifestModTimeField(item.ModTime),
 	)
 	return err
+}
+
+func manifestModTimeField(value time.Time) string {
+	if value.IsZero() {
+		return ""
+	}
+	return value.UTC().Format(time.RFC3339Nano)
 }
 
 func escapeTSV(value string) string {

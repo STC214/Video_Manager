@@ -9,32 +9,9 @@ import (
 )
 
 func PreviewEmptyDirs(ctx context.Context, root string, protectedRoots []string) ([]string, []string) {
-	var dirs []string
-	var errors []string
 	root = displayPath(root)
-	walkRoot := fsPath(root)
 	protected := normalizeExcluded(protectedRoots)
-
-	_ = filepath.WalkDir(walkRoot, func(path string, d os.DirEntry, err error) error {
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
-		if err != nil {
-			errors = appendLimited(errors, displayPath(path)+": "+err.Error(), 20)
-			return nil
-		}
-		if !d.IsDir() {
-			return nil
-		}
-		clean := displayPath(path)
-		if clean != root {
-			if _, ok := protected[strings.ToLower(clean)]; ok {
-				return filepath.SkipDir
-			}
-			dirs = append(dirs, clean)
-		}
-		return nil
-	})
+	dirs, errors := collectDirsWithRetry(ctx, root, protected)
 
 	sort.Slice(dirs, func(i, j int) bool {
 		return len(dirs[i]) > len(dirs[j])
@@ -46,7 +23,7 @@ func PreviewEmptyDirs(ctx context.Context, root string, protectedRoots []string)
 			break
 		}
 		var entries []os.DirEntry
-		err := retryIOPaths(ctx, 3, []string{dir}, func() error {
+		err := retryIOPathsWithMissing(ctx, 3, []string{dir}, true, func() error {
 			var readErr error
 			entries, readErr = os.ReadDir(fsPath(dir))
 			return readErr
@@ -63,32 +40,9 @@ func PreviewEmptyDirs(ctx context.Context, root string, protectedRoots []string)
 }
 
 func CleanupEmptyDirs(ctx context.Context, root string, protectedRoots []string) (int, []string) {
-	var dirs []string
-	var errors []string
 	root = displayPath(root)
-	walkRoot := fsPath(root)
 	protected := normalizeExcluded(protectedRoots)
-
-	_ = filepath.WalkDir(walkRoot, func(path string, d os.DirEntry, err error) error {
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
-		if err != nil {
-			errors = appendLimited(errors, displayPath(path)+": "+err.Error(), 20)
-			return nil
-		}
-		if !d.IsDir() {
-			return nil
-		}
-		clean := displayPath(path)
-		if clean != root {
-			if _, ok := protected[strings.ToLower(clean)]; ok {
-				return filepath.SkipDir
-			}
-			dirs = append(dirs, clean)
-		}
-		return nil
-	})
+	dirs, errors := collectDirsWithRetry(ctx, root, protected)
 
 	sort.Slice(dirs, func(i, j int) bool {
 		return len(dirs[i]) > len(dirs[j])
@@ -100,7 +54,7 @@ func CleanupEmptyDirs(ctx context.Context, root string, protectedRoots []string)
 			break
 		}
 		var entries []os.DirEntry
-		err := retryIOPaths(ctx, 3, []string{dir}, func() error {
+		err := retryIOPathsWithMissing(ctx, 3, []string{dir}, true, func() error {
 			var readErr error
 			entries, readErr = os.ReadDir(fsPath(dir))
 			return readErr
@@ -122,4 +76,47 @@ func CleanupEmptyDirs(ctx context.Context, root string, protectedRoots []string)
 	}
 
 	return removed, errors
+}
+
+func collectDirsWithRetry(ctx context.Context, root string, protected map[string]struct{}) ([]string, []string) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	var dirs []string
+	var errors []string
+	var walk func(string)
+	walk = func(dir string) {
+		if ctx.Err() != nil {
+			return
+		}
+		clean := displayPath(dir)
+		if clean != root {
+			if _, ok := protected[strings.ToLower(clean)]; ok {
+				return
+			}
+			dirs = append(dirs, clean)
+		}
+		var entries []os.DirEntry
+		err := retryIOPathsWithMissing(ctx, 3, []string{clean}, true, func() error {
+			var readErr error
+			entries, readErr = os.ReadDir(fsPath(clean))
+			return readErr
+		})
+		if err != nil {
+			if ctx.Err() == nil {
+				errors = appendLimited(errors, clean+": "+err.Error(), 20)
+			}
+			return
+		}
+		for _, entry := range entries {
+			if ctx.Err() != nil {
+				return
+			}
+			if entry.IsDir() {
+				walk(filepath.Join(clean, entry.Name()))
+			}
+		}
+	}
+	walk(root)
+	return dirs, errors
 }

@@ -38,7 +38,7 @@ func ExportMovePlanTSVContext(ctx context.Context, plan MovePlan, outputDir stri
 	}
 
 	writer := bufio.NewWriter(file)
-	if _, err := fmt.Fprintln(writer, "status\tsource\ttarget\tsize\tconflict\terror"); err != nil {
+	if _, err := fmt.Fprintln(writer, "status\tsource\ttarget\tsize\tconflict\terror\tmod_time_rfc3339_nano"); err != nil {
 		_ = file.Close()
 		return "", err
 	}
@@ -107,6 +107,14 @@ type MovePlan struct {
 	LastLeafFileCount   int
 	TargetDirFileLimit  int
 	ManagedExtensions   []string
+	AuditCorrect        bool
+	AuditMessage        string
+	Rebalanced          bool
+	StagingRoot         string
+	FeedFileCount       int
+	FinalTargetFiles    int
+	TargetSnapshot      string
+	StopOnError         bool
 	ConflictCount       int
 	ErrorCount          int
 	RequiredLeafDirs    int

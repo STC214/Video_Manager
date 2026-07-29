@@ -9,6 +9,7 @@ import (
 
 type Config struct {
 	SourceDir        string `json:"sourceDir"`
+	FeedDir          string `json:"feedDir"`
 	TargetDir        string `json:"targetDir"`
 	Extensions       string `json:"extensions"`
 	StartYear        int    `json:"startYear"`

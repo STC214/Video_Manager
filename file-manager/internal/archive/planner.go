@@ -127,13 +127,28 @@ type targetResolver struct {
 	dirs     map[string]targetDirState
 	dirErrs  map[string]error
 	reserved map[string]struct{}
+	ignored  map[string]struct{}
 }
 
 func newTargetResolver(ctx context.Context) *targetResolver {
+	return newTargetResolverIgnoring(ctx, nil)
+}
+
+func newTargetResolverIgnoring(ctx context.Context, ignoredPaths []string) *targetResolver {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	return &targetResolver{ctx: ctx, dirs: map[string]targetDirState{}, dirErrs: map[string]error{}, reserved: map[string]struct{}{}}
+	ignored := make(map[string]struct{}, len(ignoredPaths))
+	for _, path := range ignoredPaths {
+		ignored[strings.ToLower(DisplayPath(path))] = struct{}{}
+	}
+	return &targetResolver{
+		ctx:      ctx,
+		dirs:     map[string]targetDirState{},
+		dirErrs:  map[string]error{},
+		reserved: map[string]struct{}{},
+		ignored:  ignored,
+	}
 }
 
 func (r *targetResolver) uniquePath(path, managedExt string) (string, bool, error) {
@@ -189,6 +204,9 @@ func (r *targetResolver) loadDir(dir string) error {
 		return err
 	}
 	for _, entry := range entries {
+		if _, ignored := r.ignored[strings.ToLower(DisplayPath(filepath.Join(dir, entry.Name())))]; ignored {
+			continue
+		}
 		name := strings.ToLower(entry.Name())
 		state.names[name] = struct{}{}
 		if !entry.IsDir() {

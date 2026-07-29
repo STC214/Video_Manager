@@ -21,6 +21,7 @@ var (
 	CheckReadableDirForReadContext = core.CheckReadableDirForReadContext
 	CheckTargetRootContext         = core.CheckTargetRootContext
 	ManifestHasUndoableItems       = core.ManifestHasUndoableItems
+	CheckManifestUndoable          = core.CheckManifestUndoable
 	PreviewEmptyDirs               = core.PreviewEmptyDirs
 	CleanupEmptyDirs               = core.CleanupEmptyDirs
 	ExecuteMovePlan                = core.ExecuteMovePlan

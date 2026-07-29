@@ -3,6 +3,7 @@ package archive
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -23,6 +24,13 @@ func TestCheckTargetRootAllowsNestedNewPath(t *testing.T) {
 	target := filepath.Join(root, "new", "nested", "archive")
 	if err := CheckTargetRoot(target); err != nil {
 		t.Fatalf("expected nested target under existing root to pass: %v", err)
+	}
+}
+
+func TestCheckTargetRootAllowsRelativeNewPathWithReadableWorkingDirectory(t *testing.T) {
+	name := "new-target-" + strings.ReplaceAll(t.Name(), "/", "-")
+	if err := CheckTargetRoot(name); err != nil {
+		t.Fatalf("relative new target should use the working directory as its parent: %v", err)
 	}
 }
 

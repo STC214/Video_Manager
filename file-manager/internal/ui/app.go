@@ -44,20 +44,25 @@ const (
 	idUndo         = 1018
 	idPreviewPrev  = 1019
 	idPreviewNext  = 1020
+	idFeedEdit     = 1021
+	idBrowseFeed   = 1022
+	idFeedDryRun   = 1023
 
 	idLeafDirsMonth = 1100
 
-	wmScanComplete   = win.WM_APP + 1
-	wmMoveProgress   = win.WM_APP + 2
-	wmMoveComplete   = win.WM_APP + 3
-	wmUndoComplete   = win.WM_APP + 4
-	wmScanProgress   = win.WM_APP + 5
-	wmDryRunDone     = win.WM_APP + 6
-	wmAppInit        = win.WM_APP + 7
-	wmConfigLoaded   = win.WM_APP + 8
-	wmCloseReady     = win.WM_APP + 9
-	wmDryRunProgress = win.WM_APP + 10
-	wmBrowseDone     = win.WM_APP + 11
+	wmScanComplete     = win.WM_APP + 1
+	wmMoveProgress     = win.WM_APP + 2
+	wmMoveComplete     = win.WM_APP + 3
+	wmUndoComplete     = win.WM_APP + 4
+	wmScanProgress     = win.WM_APP + 5
+	wmDryRunDone       = win.WM_APP + 6
+	wmAppInit          = win.WM_APP + 7
+	wmConfigLoaded     = win.WM_APP + 8
+	wmCloseReady       = win.WM_APP + 9
+	wmDryRunProgress   = win.WM_APP + 10
+	wmBrowseDone       = win.WM_APP + 11
+	wmManifestChecked  = win.WM_APP + 12
+	wmConfigSaveFailed = win.WM_APP + 13
 
 	bifReturnOnlyFSDirs = 0x0001
 	bifNewDialogStyle   = 0x0040
@@ -114,6 +119,7 @@ type app struct {
 	scanResult               archive.ScanResult
 	currentPlan              archive.MovePlan
 	currentPlanConfig        archive.PlanConfig
+	currentPlanSourceRoot    string
 	moveSummary              archive.MoveSummary
 	undoSummary              archive.UndoSummary
 	moveStatus               string
@@ -121,6 +127,7 @@ type app struct {
 	moveTotal                int
 	moveNetwork              bool
 	moveProgressBusy         bool
+	moveCleanupMessages      []string
 	moveCancel               context.CancelFunc
 	scanCancel               context.CancelFunc
 	scanStatus               string
@@ -131,6 +138,7 @@ type app struct {
 	dryRunLines              []string
 	dryRunPage               int
 	dryRunNetworkStage       int
+	dryRunFeed               bool
 	browsing                 bool
 	browseKind               int
 	browsePath               string
@@ -153,6 +161,11 @@ type app struct {
 	configWritten            uint64
 	pendingConfig            appconfig.Config
 	pendingManifestAvailable bool
+	pendingManifestCheckErr  error
+	pendingManifestPath      string
+	pendingConfigSaveErr     error
+	manifestChecking         bool
+	manifestCheckNetwork     bool
 	configLoadErr            error
 	configEdited             bool
 	closing                  bool
@@ -229,7 +242,7 @@ func Run() {
 		win.CW_USEDEFAULT,
 		win.CW_USEDEFAULT,
 		1060,
-		720,
+		780,
 		0,
 		0,
 		a.instance,
@@ -296,10 +309,9 @@ func wndProc(hwnd win.HWND, msg uint32, wParam, lParam uintptr) uintptr {
 			startupTrace("APP_INIT: recalculate done")
 			go func() {
 				cfg, err := appconfig.Load()
-				manifestAvailable := err == nil && archive.ManifestHasUndoableItems(cfg.LastManifest)
 				a.mu.Lock()
 				a.pendingConfig = cfg
-				a.pendingManifestAvailable = manifestAvailable
+				a.pendingManifestAvailable = false
 				a.configLoadErr = err
 				a.mu.Unlock()
 				win.PostMessage(a.hwnd, wmConfigLoaded, 0, 0)
@@ -308,6 +320,14 @@ func wndProc(hwnd win.HWND, msg uint32, wParam, lParam uintptr) uintptr {
 	case wmConfigLoaded:
 		if a != nil {
 			a.finishConfigLoad()
+		}
+	case wmManifestChecked:
+		if a != nil {
+			a.finishManifestCheck()
+		}
+	case wmConfigSaveFailed:
+		if a != nil {
+			a.finishConfigSaveFailed()
 		}
 	case wmCloseReady:
 		win.DestroyWindow(hwnd)
@@ -322,7 +342,7 @@ func wndProc(hwnd win.HWND, msg uint32, wParam, lParam uintptr) uintptr {
 	case win.WM_GETMINMAXINFO:
 		mmi := (*win.MINMAXINFO)(unsafe.Pointer(lParam))
 		mmi.PtMinTrackSize.X = 1060
-		mmi.PtMinTrackSize.Y = 720
+		mmi.PtMinTrackSize.Y = 780
 		return 0
 	case wmScanComplete:
 		if a != nil {
@@ -404,39 +424,43 @@ func (a *app) createControls() {
 	a.controls[idTargetEdit] = a.edit(idTargetEdit, "", 100, 58, 690, 28, false)
 	a.button(idBrowseTarget, "浏览...", 805, 57, 105, 30)
 	a.button(idDryRun, "生成 Dry-run", 920, 57, 105, 30)
-	a.controls[idProgress] = a.progress(idProgress, 100, 96, 580, 20)
-	a.button(idCancel, "取消", 700, 91, 100, 30)
-	a.button(idMove, "开始移动", 810, 91, 100, 30)
-	a.button(idUndo, "撤销最近", 920, 91, 105, 30)
+	a.label("投料目录", 24, 96, 80, 24)
+	a.controls[idFeedEdit] = a.edit(idFeedEdit, "", 100, 94, 690, 28, false)
+	a.button(idBrowseFeed, "浏览...", 805, 93, 105, 30)
+	a.button(idFeedDryRun, "投料 Dry-run", 920, 93, 105, 30)
+	a.controls[idProgress] = a.progress(idProgress, 100, 132, 580, 20)
+	a.button(idCancel, "取消", 700, 127, 100, 30)
+	a.button(idMove, "开始移动", 810, 127, 100, 30)
+	a.button(idUndo, "撤销最近", 920, 127, 105, 30)
 
-	a.label("按年份 / 季度 / 月份归档容量计算器", 24, 136, 300, 24)
-	a.label("目标文件总数", 24, 172, 110, 24)
-	a.controls[idTotalFiles] = a.edit(idTotalFiles, "0", 140, 168, 110, 28, true)
-	a.controls[idCalculate] = a.button(idCalculate, "重新计算", 900, 167, 125, 30)
+	a.label("按年份 / 季度 / 月份归档容量计算器", 24, 172, 300, 24)
+	a.label("目标文件总数", 24, 208, 110, 24)
+	a.controls[idTotalFiles] = a.edit(idTotalFiles, "0", 140, 204, 110, 28, true)
+	a.controls[idCalculate] = a.button(idCalculate, "重新计算", 900, 203, 125, 30)
 
-	a.label("文件后缀", 24, 210, 80, 24)
-	a.controls[idExtensions] = a.edit(idExtensions, ".jpg,.png", 100, 206, 260, 28, false)
-	a.label("起始年份", 385, 210, 80, 24)
-	a.controls[idStartYear] = a.edit(idStartYear, strconv.Itoa(time.Now().Year()), 465, 206, 75, 28, true)
-	a.label("每月叶目录数", 565, 210, 110, 24)
-	a.controls[idLeafDirsMonth] = a.edit(idLeafDirsMonth, "4", 680, 206, 70, 28, true)
-	a.label("每叶文件数", 775, 210, 100, 24)
-	a.controls[idFilesLeaf] = a.edit(idFilesLeaf, "30", 875, 206, 70, 28, true)
+	a.label("文件后缀", 24, 246, 80, 24)
+	a.controls[idExtensions] = a.edit(idExtensions, ".jpg,.png", 100, 242, 260, 28, false)
+	a.label("起始年份", 385, 246, 80, 24)
+	a.controls[idStartYear] = a.edit(idStartYear, strconv.Itoa(time.Now().Year()), 465, 242, 75, 28, true)
+	a.label("每月叶目录数", 565, 246, 110, 24)
+	a.controls[idLeafDirsMonth] = a.edit(idLeafDirsMonth, "4", 680, 242, 70, 28, true)
+	a.label("每叶文件数", 775, 246, 100, 24)
+	a.controls[idFilesLeaf] = a.edit(idFilesLeaf, "30", 875, 242, 70, 28, true)
 
-	a.label("目录规则", 24, 252, 90, 24)
-	a.label("YYYY  →  YYYYS1..S4  →  YYYYMM  →  YYYYMMNN", 115, 252, 360, 24)
-	a.label("计算结果", 500, 252, 120, 24)
-	a.controls[idResult] = a.textArea(idResult, 500, 279, 525, 145, false)
+	a.label("目录规则", 24, 288, 90, 24)
+	a.label("YYYY  →  YYYYS1..S4  →  YYYYMM  →  YYYYMMNN", 115, 288, 360, 24)
+	a.label("计算结果", 500, 288, 120, 24)
+	a.controls[idResult] = a.textArea(idResult, 500, 315, 525, 145, false)
 	a.setReadOnly(a.controls[idResult])
 
-	a.label("预览", 24, 450, 90, 24)
-	a.button(idPreviewPrev, "上一页", 360, 444, 68, 28)
-	a.button(idPreviewNext, "下一页", 436, 444, 68, 28)
-	a.controls[idPreview] = a.textArea(idPreview, 24, 476, 490, 180, true)
+	a.label("预览", 24, 486, 90, 24)
+	a.button(idPreviewPrev, "上一页", 360, 480, 68, 28)
+	a.button(idPreviewNext, "下一页", 436, 480, 68, 28)
+	a.controls[idPreview] = a.textArea(idPreview, 24, 512, 490, 180, true)
 	a.setReadOnly(a.controls[idPreview])
 
-	a.label("日志", 526, 450, 90, 24)
-	a.controls[idLog] = a.textArea(idLog, 526, 476, 499, 180, true)
+	a.label("日志", 526, 486, 90, 24)
+	a.controls[idLog] = a.textArea(idLog, 526, 512, 499, 180, true)
 	a.setReadOnly(a.controls[idLog])
 
 	a.setText(a.controls[idCalculate], "重新计算")
@@ -453,7 +477,7 @@ func (a *app) setActionState(scan, dryRun, move, cancel, undo bool) {
 
 func (a *app) setConfigurationEnabled(enabled bool) {
 	ids := []int{
-		idSourceEdit, idBrowse, idTargetEdit, idBrowseTarget,
+		idSourceEdit, idBrowse, idTargetEdit, idBrowseTarget, idFeedEdit, idBrowseFeed, idFeedDryRun,
 		idTotalFiles, idCalculate, idStartYear, idExtensions, idLeafDirsMonth, idFilesLeaf,
 	}
 	for _, id := range ids {
@@ -483,6 +507,11 @@ func (a *app) handleCommand(wParam, lParam uintptr) {
 			current := strings.TrimSpace(a.text(a.controls[idTargetEdit]))
 			a.startBrowse(idBrowseTarget, "选择归档目标目录", current, "", "")
 		}
+	case idBrowseFeed:
+		if code == win.BN_CLICKED {
+			current := strings.TrimSpace(a.text(a.controls[idFeedEdit]))
+			a.startBrowse(idBrowseFeed, "选择投料目录", current, "", "")
+		}
 	case idScan:
 		if code == win.BN_CLICKED {
 			a.startScan()
@@ -490,6 +519,10 @@ func (a *app) handleCommand(wParam, lParam uintptr) {
 	case idDryRun:
 		if code == win.BN_CLICKED {
 			a.generateDryRun()
+		}
+	case idFeedDryRun:
+		if code == win.BN_CLICKED {
+			a.generateFeedDryRun()
 		}
 	case idMove:
 		if code == win.BN_CLICKED {
@@ -516,6 +549,9 @@ func (a *app) handleCommand(wParam, lParam uintptr) {
 			a.recalculate()
 		}
 	default:
+		if !a.initializing && lParam != 0 && code == win.EN_CHANGE && id == idFeedEdit {
+			a.invalidateFeedDependentState()
+		}
 		if !a.initializing && lParam != 0 && code == win.EN_CHANGE && (id == idSourceEdit || id == idTargetEdit || id == idExtensions) {
 			a.invalidatePathDependentState()
 		}
@@ -619,6 +655,11 @@ func (a *app) finishBrowse() {
 		a.log("当前目标目录: " + strings.TrimSpace(a.text(a.controls[idTargetEdit])))
 		return
 	}
+	if kind == idBrowseFeed {
+		a.setText(a.controls[idFeedEdit], path)
+		a.log("已选择投料目录: " + path)
+		return
+	}
 	a.setText(a.controls[idTargetEdit], path)
 	a.log("已选择目标目录: " + path)
 }
@@ -632,6 +673,7 @@ func (a *app) invalidatePathDependentState() {
 	a.scanResult = archive.ScanResult{}
 	a.currentPlan = archive.MovePlan{}
 	a.currentPlanConfig = archive.PlanConfig{}
+	a.currentPlanSourceRoot = ""
 	a.dryRunPreview = ""
 	a.dryRunLines = nil
 	a.dryRunTSV = ""
@@ -641,6 +683,27 @@ func (a *app) invalidatePathDependentState() {
 
 	a.setTextNoFlicker(a.controls[idPreview], "路径已变化，请重新扫描并生成 Dry-run。")
 	a.setActionState(true, false, false, false, hasManifest)
+}
+
+func (a *app) invalidateFeedDependentState() {
+	a.mu.Lock()
+	if a.scanning || a.dryRunning || a.moving {
+		a.mu.Unlock()
+		return
+	}
+	a.currentPlan = archive.MovePlan{}
+	a.currentPlanConfig = archive.PlanConfig{}
+	a.currentPlanSourceRoot = ""
+	a.dryRunPreview = ""
+	a.dryRunLines = nil
+	a.dryRunTSV = ""
+	a.dryRunError = ""
+	hasScan := len(a.scanResult.Files) > 0
+	hasManifest := a.lastManifestAvailable
+	a.mu.Unlock()
+
+	a.setTextNoFlicker(a.controls[idPreview], "投料目录已变化，请重新生成投料 Dry-run。")
+	a.setActionState(true, hasScan, false, false, hasManifest)
 }
 
 func isPlanConfigurationControl(id int) bool {
@@ -655,6 +718,7 @@ func (a *app) invalidatePlanForConfigurationChange() {
 	}
 	a.currentPlan = archive.MovePlan{}
 	a.currentPlanConfig = archive.PlanConfig{}
+	a.currentPlanSourceRoot = ""
 	hasScan := len(a.scanResult.Files) > 0
 	hasManifest := a.lastManifestAvailable
 	a.mu.Unlock()
@@ -683,7 +747,7 @@ func isConfigurationCommand(id, code int) bool {
 	if code != win.EN_CHANGE {
 		return false
 	}
-	return id == idSourceEdit || id == idTargetEdit || id == idExtensions ||
+	return id == idSourceEdit || id == idFeedEdit || id == idTargetEdit || id == idExtensions ||
 		id == idTotalFiles || id == idStartYear || id == idLeafDirsMonth || id == idFilesLeaf
 }
 
@@ -787,8 +851,9 @@ func (a *app) finishScan() {
 	result := a.scanResult
 	hasManifest := a.lastManifestAvailable
 	a.mu.Unlock()
+	hasUsableScan := len(result.Files) > 0 && result.ErrorCount == 0 && !result.Cancelled
 	a.setConfigurationEnabled(true)
-	a.setActionState(true, len(result.Files) > 0, false, false, hasManifest)
+	a.setActionState(true, hasUsableScan, false, false, hasManifest)
 
 	a.setText(a.controls[idCalculate], "重新计算")
 	a.setText(a.controls[idTotalFiles], strconv.Itoa(result.MatchedCount))
@@ -825,6 +890,16 @@ func (a *app) generateDryRun() {
 	}
 	result := a.scanResult
 	a.mu.Unlock()
+	if result.Cancelled {
+		cancel()
+		a.log("上次扫描已取消，结果不完整；请重新扫描后再生成 Dry-run。")
+		return
+	}
+	if result.ErrorCount > 0 {
+		cancel()
+		a.log(fmt.Sprintf("上次扫描有 %d 个读取错误，结果不完整；请排除错误并重新扫描。", result.ErrorCount))
+		return
+	}
 	if len(result.Files) == 0 {
 		cancel()
 		a.log("没有可生成 dry-run 的扫描结果，请先扫描包含目标文件的目录。")
@@ -850,6 +925,10 @@ func (a *app) generateDryRun() {
 	a.mu.Lock()
 	a.dryRunning = true
 	a.dryRunCancel = cancel
+	a.dryRunFeed = false
+	a.currentPlan = archive.MovePlan{}
+	a.currentPlanConfig = archive.PlanConfig{}
+	a.currentPlanSourceRoot = ""
 	a.dryRunPreview = ""
 	a.dryRunTSV = ""
 	a.dryRunError = ""
@@ -960,6 +1039,7 @@ func (a *app) generateDryRun() {
 		if ctx.Err() == nil {
 			a.currentPlan = plan
 			a.currentPlanConfig = cfg
+			a.currentPlanSourceRoot = sourceRoot
 		}
 		a.dryRunLines = lines
 		a.dryRunTSV = tsvPath
@@ -971,6 +1051,198 @@ func (a *app) generateDryRun() {
 	}()
 }
 
+func (a *app) generateFeedDryRun() {
+	ctx, cancel := context.WithCancel(context.Background())
+	a.mu.Lock()
+	if a.dryRunning || a.scanning || a.moving {
+		a.mu.Unlock()
+		cancel()
+		a.log("已有任务进行中，请等待完成或取消。")
+		return
+	}
+	a.mu.Unlock()
+
+	feedRoot := strings.TrimSpace(a.text(a.controls[idFeedEdit]))
+	targetRoot := strings.TrimSpace(a.text(a.controls[idTargetEdit]))
+	if feedRoot == "" || targetRoot == "" {
+		cancel()
+		a.log("请先选择投料目录和目标目录。")
+		return
+	}
+	if archive.SamePath(feedRoot, targetRoot) {
+		cancel()
+		a.log("投料目录和目标目录不能相同。")
+		return
+	}
+	if pathIsSameOrInside(feedRoot, targetRoot) {
+		cancel()
+		a.log("投料目录不能位于目标目录内部，否则会被目标审计当作待重排文件。")
+		return
+	}
+	extensions, extensionErr := archive.ParseExtensions(a.text(a.controls[idExtensions]))
+	if extensionErr != nil {
+		cancel()
+		a.log(extensionErr.Error())
+		return
+	}
+	cfg := a.planConfig(1)
+	cfg.Extensions = extensions
+	if err := archive.ValidateConfigForFiles(cfg, 1); err != nil {
+		cancel()
+		a.log("归档配置无效: " + err.Error())
+		return
+	}
+
+	a.mu.Lock()
+	a.dryRunning = true
+	a.dryRunCancel = cancel
+	a.dryRunFeed = true
+	a.currentPlan = archive.MovePlan{}
+	a.currentPlanConfig = archive.PlanConfig{}
+	a.currentPlanSourceRoot = ""
+	a.dryRunPreview = ""
+	a.dryRunTSV = ""
+	a.dryRunError = ""
+	a.dryRunLines = nil
+	a.dryRunPage = 0
+	networkRead := archive.IsLikelyNetworkPath(feedRoot) || archive.IsLikelyNetworkPath(targetRoot)
+	if networkRead {
+		a.dryRunNetworkStage = 4
+	} else {
+		a.dryRunNetworkStage = 0
+	}
+	a.mu.Unlock()
+
+	a.setConfigurationEnabled(false)
+	a.setActionState(false, false, false, true, false)
+	if networkRead {
+		a.setProgressBusy(true)
+		a.log("检测到网络路径，正在后台读取投料和目标目录；UI 可继续响应，也可取消。")
+	} else {
+		a.setProgress(0, 4)
+	}
+	a.setTextNoFlicker(a.controls[idPreview], "正在扫描投料并审计目标目录，请稍候…")
+	a.log("开始生成投料 Dry-run。")
+
+	go func() {
+		fail := func(message string) {
+			a.mu.Lock()
+			a.dryRunError = message
+			a.dryRunning = false
+			a.dryRunCancel = nil
+			a.mu.Unlock()
+			win.PostMessage(a.hwnd, wmDryRunDone, 0, 0)
+		}
+		if err := archive.CheckReadableDirForReadContext(ctx, feedRoot); err != nil {
+			fail("投料目录不可访问: " + err.Error())
+			return
+		}
+		excluded := []string{}
+		if pathIsSameOrInside(targetRoot, feedRoot) {
+			excluded = append(excluded, targetRoot)
+		}
+		feedScan := archive.ScanFilesWithProgress(ctx, feedRoot, excluded, extensions, nil)
+		if ctx.Err() != nil || feedScan.Cancelled {
+			fail("投料 Dry-run 已取消。")
+			return
+		}
+		if feedScan.ErrorCount > 0 {
+			fail(fmt.Sprintf("投料目录扫描存在 %d 个读取错误: %s", feedScan.ErrorCount, strings.Join(feedScan.Errors, "; ")))
+			return
+		}
+		if len(feedScan.Files) == 0 {
+			fail("投料目录中没有符合当前后缀设置的文件。")
+			return
+		}
+		a.postDryRunProgress(1)
+
+		if err := archive.CheckTargetRootContext(ctx, targetRoot); err != nil {
+			fail("目标目录不可访问: " + err.Error())
+			return
+		}
+		plan := archive.BuildFeedPlanContext(ctx, feedScan.Files, cfg)
+		if ctx.Err() != nil {
+			fail("投料 Dry-run 已取消。")
+			return
+		}
+		a.postDryRunProgress(2)
+
+		auditState := "正确，仅续排投料文件"
+		if plan.ErrorCount > 0 {
+			auditState = "审计失败，已禁止正式移动"
+		} else if plan.Rebalanced {
+			auditState = "不符合数量/目录规则，将先重排现有目标文件，再追加投料"
+		}
+		lines := []string{
+			fmt.Sprintf("投料 Dry-run: 投料文件 %d 个，目标已有匹配文件 %d 个，移动操作 %d 项，错误 %d 项。",
+				len(feedScan.Files), plan.ExistingTargetFiles, len(plan.Items), plan.ErrorCount),
+			"目标审计: " + auditState,
+			"审计说明: " + plan.AuditMessage,
+			"排序规则: 需要重排时，现有目标文件按修改时间从老到新重排；投料文件随后按修改时间从老到新追加。",
+			fmt.Sprintf("目录规则: 从 %04d 年开始，每月 %d 个叶目录，每叶最多 %d 个文件。", cfg.StartYear, cfg.LeafDirsPerMonth, cfg.FilesPerLeaf),
+			fmt.Sprintf("规划后最后叶目录: %s，其中匹配文件 %d 个。", emptyDash(plan.LastLeafPath), plan.LastLeafFileCount),
+			"",
+		}
+		if plan.ErrorCount > 0 {
+			lines = append(lines, "计划错误明细:")
+			lines = append(lines, planErrorMessages(plan, 20)...)
+			lines = append(lines, "")
+		}
+		for _, item := range plan.Items {
+			prefix := ""
+			if plan.StagingRoot != "" && pathIsSameOrInside(item.TargetPath, plan.StagingRoot) {
+				prefix = "STAGE: "
+			}
+			if item.Error != "" {
+				prefix = "ERROR: "
+			}
+			lines = append(lines, prefix+item.SourcePath+" -> "+item.TargetPath)
+		}
+		dirs, errs := archive.PreviewEmptyDirs(ctx, feedRoot, excluded)
+		lines = append(lines, "", fmt.Sprintf("投料后计划清理空目录: %d 个，预览错误 %d 个。", len(dirs), len(errs)))
+		for i := 0; i < len(dirs) && i < 30; i++ {
+			lines = append(lines, "DELETE EMPTY DIR: "+dirs[i])
+		}
+		a.postDryRunProgress(3)
+
+		tsvPath := ""
+		errText := ""
+		dataDir, dataErr := appconfig.DataDir()
+		if dataErr != nil {
+			errText = "Dry-run 数据目录不可用: " + dataErr.Error()
+		} else if path, exportErr := archive.ExportMovePlanTSVContext(ctx, plan, filepath.Join(dataDir, "dry-runs")); exportErr != nil {
+			errText = "Dry-run TSV 导出失败: " + exportErr.Error()
+		} else {
+			tsvPath = path
+			a.postDryRunProgress(4)
+		}
+
+		a.mu.Lock()
+		if ctx.Err() == nil {
+			a.currentPlan = plan
+			a.currentPlanConfig = cfg
+			a.currentPlanSourceRoot = feedRoot
+		}
+		a.dryRunLines = lines
+		a.dryRunTSV = tsvPath
+		a.dryRunError = errText
+		a.dryRunning = false
+		a.dryRunCancel = nil
+		a.mu.Unlock()
+		win.PostMessage(a.hwnd, wmDryRunDone, 0, 0)
+	}()
+}
+
+func pathIsSameOrInside(path, root string) bool {
+	path = archive.DisplayPath(strings.TrimSpace(path))
+	root = archive.DisplayPath(strings.TrimSpace(root))
+	rel, err := filepath.Rel(root, path)
+	if err != nil {
+		return false
+	}
+	return rel == "." || (rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)))
+}
+
 func (a *app) finishDryRun() {
 	defer a.maybeFinishClose()
 	a.mu.Lock()
@@ -980,12 +1252,19 @@ func (a *app) finishDryRun() {
 	errText := a.dryRunError
 	itemCount := len(a.currentPlan.Items)
 	planErrors := a.currentPlan.ErrorCount
+	finalTargetFiles := a.currentPlan.FinalTargetFiles
 	hasManifest := a.lastManifestAvailable
+	hasScan := len(a.scanResult.Files) > 0
 	networkStage := a.dryRunNetworkStage
 	a.dryRunNetworkStage = 0
+	a.dryRunFeed = false
 	a.mu.Unlock()
 	a.setConfigurationEnabled(true)
-	a.setActionState(true, true, errText == "" && itemCount > 0 && planErrors == 0, false, hasManifest)
+	a.setActionState(true, hasScan, errText == "" && itemCount > 0 && planErrors == 0, false, hasManifest)
+	if finalTargetFiles > 0 {
+		a.setText(a.controls[idTotalFiles], strconv.Itoa(finalTargetFiles))
+		a.recalculate()
+	}
 	if networkStage > 0 {
 		a.setProgressBusy(false)
 		if errText != "" {
@@ -1038,9 +1317,13 @@ func (a *app) postDryRunProgress(done int) {
 func (a *app) showDryRunProgress(done int) {
 	a.mu.Lock()
 	networkStage := a.dryRunNetworkStage
+	feed := a.dryRunFeed
 	a.mu.Unlock()
 	if networkStage > 0 && done < networkStage {
 		status := dryRunProgressMessage(done)
+		if feed {
+			status = feedDryRunProgressMessage(done)
+		}
 		if status != "" {
 			a.log(status + " 正在读取网络目录……")
 		}
@@ -1048,8 +1331,26 @@ func (a *app) showDryRunProgress(done int) {
 	}
 	a.setProgress(done, 4)
 	status := dryRunProgressMessage(done)
+	if feed {
+		status = feedDryRunProgressMessage(done)
+	}
 	if status != "" {
 		a.log(status)
+	}
+}
+
+func feedDryRunProgressMessage(done int) string {
+	switch done {
+	case 1:
+		return "投料 Dry-run 进度 1/4: 投料目录扫描完成。"
+	case 2:
+		return "投料 Dry-run 进度 2/4: 目标审计与移动计划生成完成。"
+	case 3:
+		return "投料 Dry-run 进度 3/4: 空目录预览完成。"
+	case 4:
+		return "投料 Dry-run 进度 4/4: TSV 导出完成。"
+	default:
+		return ""
 	}
 }
 
@@ -1134,7 +1435,7 @@ func (a *app) startMove() {
 	planCfg := a.currentPlanConfig
 	a.mu.Unlock()
 	currentCfg := a.planConfig(len(plan.Items))
-	if err := archive.ValidateConfigForFiles(currentCfg, len(plan.Items)); err != nil {
+	if err := archive.ValidateConfigForFiles(currentCfg, 1); err != nil {
 		a.log("归档配置无效: " + err.Error())
 		return
 	}
@@ -1152,6 +1453,10 @@ func (a *app) startMove() {
 		return
 	}
 	confirmText := fmt.Sprintf("即将移动 %d 个文件。\r\n目标目录：%s\r\n\r\n确认开始正式移动？", len(plan.Items), plan.TargetRoot)
+	if plan.Rebalanced {
+		confirmText = fmt.Sprintf("目标目录数量或结构不符合当前规则。\r\n将先重排 %d 个现有目标文件，再追加投料；共执行 %d 次移动。\r\n\r\n目标目录：%s\r\n\r\n确认开始？",
+			plan.ExistingTargetFiles, len(plan.Items), plan.TargetRoot)
+	}
 	if win.MessageBox(a.hwnd, syscall.StringToUTF16Ptr(confirmText), syscall.StringToUTF16Ptr("确认移动"), win.MB_YESNO|win.MB_ICONWARNING|win.MB_DEFBUTTON2) != win.IDYES {
 		a.log("已取消正式移动。")
 		return
@@ -1166,6 +1471,7 @@ func (a *app) startMove() {
 	a.moveCancel = cancel
 	a.moving = true
 	a.moveStatus = "开始移动..."
+	a.moveCleanupMessages = nil
 	a.mu.Unlock()
 
 	a.setConfigurationEnabled(false)
@@ -1174,7 +1480,10 @@ func (a *app) startMove() {
 	a.setProgress(0, len(plan.Items))
 	a.log("开始正式移动文件。")
 
-	sourceRoot := strings.TrimSpace(a.text(a.controls[idSourceEdit]))
+	sourceRoot := a.currentPlanSourceRoot
+	if strings.TrimSpace(sourceRoot) == "" {
+		sourceRoot = strings.TrimSpace(a.text(a.controls[idSourceEdit]))
+	}
 	targetRoot := strings.TrimSpace(a.text(a.controls[idTargetEdit]))
 	networkMove := archive.IsLikelyNetworkPath(sourceRoot) || archive.IsLikelyNetworkPath(targetRoot) || archive.IsLikelyNetworkPath(plan.TargetRoot)
 	a.mu.Lock()
@@ -1182,10 +1491,52 @@ func (a *app) startMove() {
 	a.moveProgressBusy = false
 	a.mu.Unlock()
 	if networkMove {
+		a.mu.Lock()
+		a.moveProgressBusy = true
+		a.moveStatus = "正在初始化网络运行清单……"
+		a.mu.Unlock()
+		a.setProgressBusy(true)
 		a.log("检测到网络路径，移动、复制和删除会使用更长重试等待；取消会在当前 I/O 或复制块结束后生效。")
+	}
+	if plan.FeedFileCount > 0 {
+		a.mu.Lock()
+		a.moveProgressBusy = true
+		a.moveStatus = "正式移动前正在重新审计目标目录……"
+		a.mu.Unlock()
+		a.setProgressBusy(true)
+		a.log("正式移动前正在重新审计目标目录并核对 Dry-run 快照。")
 	}
 
 	go func() {
+		if plan.FeedFileCount > 0 {
+			if err := archive.ValidateFeedPlanPreflight(ctx, plan, planCfg); err != nil {
+				summary := archive.MoveSummary{Total: len(plan.Items), Failed: len(plan.Items), Error: "投料前重新审计失败: " + err.Error()}
+				if ctx.Err() != nil {
+					summary.Failed = 0
+					summary.Cancelled = true
+					summary.Error = ""
+				}
+				a.mu.Lock()
+				a.moveSummary = summary
+				a.moving = false
+				a.moveCancel = nil
+				a.moveProgressBusy = false
+				a.mu.Unlock()
+				win.PostMessage(a.hwnd, wmMoveComplete, 0, 0)
+				return
+			}
+			a.mu.Lock()
+			a.moveProgressBusy = networkMove
+			if networkMove {
+				a.moveStatus = "投料前复审通过，正在初始化网络运行清单……"
+			} else {
+				a.moveStatus = "投料前目标目录复审通过，开始正式移动。"
+			}
+			a.moveDone = 0
+			a.moveTotal = len(plan.Items)
+			a.mu.Unlock()
+			win.PostMessage(a.hwnd, wmMoveProgress, 0, 0)
+		}
 		lastPost := time.Now().Add(-time.Second)
 		summary := archive.ExecuteMovePlan(ctx, plan, archive.MoveOptions{ReportItemStart: networkMove}, func(progress archive.MoveProgress) {
 			if progress.Status != "processing" && time.Since(lastPost) < 250*time.Millisecond && progress.Index != progress.Total {
@@ -1207,10 +1558,40 @@ func (a *app) startMove() {
 			win.PostMessage(a.hwnd, wmMoveProgress, 0, 0)
 		})
 		if !summary.Cancelled && summary.Error == "" && summary.Moved > 0 && sourceRoot != "" {
+			if archive.IsLikelyNetworkPath(sourceRoot) {
+				a.mu.Lock()
+				a.moveProgressBusy = true
+				a.moveStatus = "正在读取网络源目录并清理空目录……"
+				a.mu.Unlock()
+				win.PostMessage(a.hwnd, wmMoveProgress, 0, 0)
+			}
 			removed, errs := archive.CleanupEmptyDirs(ctx, sourceRoot, []string{targetRoot})
 			if len(errs) > 0 {
 				a.mu.Lock()
 				a.moveStatus = fmt.Sprintf("空目录清理完成: 删除 %d 个，错误 %d 个", removed, len(errs))
+				a.moveCleanupMessages = append(a.moveCleanupMessages, a.moveStatus)
+				for i := 0; i < len(errs) && i < 3; i++ {
+					a.moveCleanupMessages = append(a.moveCleanupMessages, "空目录清理错误: "+errs[i])
+				}
+				a.mu.Unlock()
+			}
+		}
+		if !summary.Cancelled && summary.Error == "" && summary.Failed == 0 && plan.StagingRoot != "" {
+			if archive.IsLikelyNetworkPath(plan.StagingRoot) {
+				a.mu.Lock()
+				a.moveProgressBusy = true
+				a.moveStatus = "正在读取网络目标目录并清理投料临时目录……"
+				a.mu.Unlock()
+				win.PostMessage(a.hwnd, wmMoveProgress, 0, 0)
+			}
+			removed, errs := archive.CleanupFeedStaging(ctx, plan.StagingRoot)
+			if len(errs) > 0 {
+				a.mu.Lock()
+				a.moveStatus = fmt.Sprintf("投料临时目录清理完成: 删除 %d 个，错误 %d 个。", removed, len(errs))
+				a.moveCleanupMessages = append(a.moveCleanupMessages, a.moveStatus)
+				for i := 0; i < len(errs) && i < 3; i++ {
+					a.moveCleanupMessages = append(a.moveCleanupMessages, "投料临时目录清理错误: "+errs[i])
+				}
 				a.mu.Unlock()
 			}
 		}
@@ -1326,7 +1707,9 @@ func (a *app) maybeFinishClose() {
 	a.closeSaveStarted = true
 	sequence, cfg := a.configSaveRequest()
 	go func() {
-		a.writeConfig(sequence, cfg)
+		if err := a.writeConfig(sequence, cfg); err != nil {
+			a.reportConfigSaveError(err)
+		}
 		win.PostMessage(a.hwnd, wmCloseReady, 0, 0)
 	}()
 }
@@ -1361,8 +1744,11 @@ func (a *app) finishMove() {
 	defer a.maybeFinishClose()
 	a.mu.Lock()
 	summary := a.moveSummary
+	cleanupMessages := append([]string(nil), a.moveCleanupMessages...)
+	a.moveCleanupMessages = nil
 	a.currentPlan = archive.MovePlan{}
 	a.currentPlanConfig = archive.PlanConfig{}
+	a.currentPlanSourceRoot = ""
 	lastManifest, newManifest := manifestAfterMove(a.lastManifest, summary)
 	a.lastManifest = lastManifest
 	if newManifest {
@@ -1378,6 +1764,9 @@ func (a *app) finishMove() {
 	a.log(fmt.Sprintf("移动完成: 总数 %d, 成功 %d, 失败 %d, 已取消 %s", summary.Total, summary.Moved, summary.Failed, yesNo(summary.Cancelled)))
 	if summary.Error != "" {
 		a.log("移动安全检查错误: " + summary.Error)
+	}
+	for _, message := range cleanupMessages {
+		a.log(message)
 	}
 	if newManifest {
 		a.saveConfigAsync()
@@ -1425,12 +1814,15 @@ func (a *app) startUndo() {
 	a.moveCancel = cancel
 	a.moveStatus = "开始撤销..."
 	a.moveNetwork = networkUndo
-	a.moveProgressBusy = false
+	a.moveProgressBusy = networkUndo
+	if networkUndo {
+		a.moveStatus = "正在读取网络运行清单……"
+	}
 	a.mu.Unlock()
 
 	a.setConfigurationEnabled(false)
 	a.setActionState(false, false, false, true, false)
-	a.setProgressBusy(false)
+	a.setProgressBusy(networkUndo)
 	a.setProgress(0, 1)
 	a.log("开始撤销最近一次移动。")
 
@@ -1521,10 +1913,81 @@ func (a *app) finishConfigLoad() {
 	a.applyConfig(cfg, manifestAvailable)
 	a.initializing = false
 	a.recalculate()
+	a.startManifestCheck(cfg.LastManifest)
+}
+
+func (a *app) startManifestCheck(manifest string) {
+	manifest = strings.TrimSpace(manifest)
+	if manifest == "" {
+		return
+	}
+	network := archive.IsLikelyNetworkPath(manifest)
+	a.mu.Lock()
+	a.manifestChecking = true
+	a.manifestCheckNetwork = network
+	a.pendingManifestPath = manifest
+	a.pendingManifestAvailable = false
+	a.pendingManifestCheckErr = nil
+	a.mu.Unlock()
+	if network {
+		a.setProgressBusy(true)
+		a.log("正在后台检查网络运行清单，配置已先行加载……")
+	}
+	go func() {
+		available, err := archive.CheckManifestUndoable(manifest)
+		a.mu.Lock()
+		a.pendingManifestAvailable = available
+		a.pendingManifestCheckErr = err
+		a.manifestChecking = false
+		a.mu.Unlock()
+		win.PostMessage(a.hwnd, wmManifestChecked, 0, 0)
+	}()
+}
+
+func (a *app) finishManifestCheck() {
+	a.mu.Lock()
+	manifest := a.pendingManifestPath
+	available := a.pendingManifestAvailable
+	checkErr := a.pendingManifestCheckErr
+	network := a.manifestCheckNetwork
+	active := a.browsing || a.scanning || a.dryRunning || a.moving
+	sameManifest := archive.SamePath(a.lastManifest, manifest)
+	closing := a.closing
+	if sameManifest {
+		a.lastManifestAvailable = available
+	}
+	a.pendingManifestPath = ""
+	a.pendingManifestCheckErr = nil
+	a.manifestCheckNetwork = false
+	a.mu.Unlock()
+
+	if closing {
+		return
+	}
+	if network && !active {
+		a.setProgressBusy(false)
+		a.setProgress(0, 1)
+	}
+	if !sameManifest {
+		return
+	}
+	win.EnableWindow(a.controls[idUndo], available && !active)
+	if checkErr != nil {
+		if available {
+			a.log("运行清单存在需要人工确认的恢复状态，撤销时将再次校验: " + checkErr.Error())
+		} else {
+			a.log("无法检查最近运行清单，撤销暂不可用: " + checkErr.Error())
+		}
+		return
+	}
+	if available {
+		a.log("最近运行清单检查完成，可以撤销。")
+	}
 }
 
 func (a *app) applyConfig(cfg appconfig.Config, manifestAvailable bool) {
 	a.setText(a.controls[idSourceEdit], cfg.SourceDir)
+	a.setText(a.controls[idFeedEdit], cfg.FeedDir)
 	a.setText(a.controls[idTargetEdit], cfg.TargetDir)
 	if strings.TrimSpace(cfg.Extensions) != "" {
 		a.setText(a.controls[idExtensions], cfg.Extensions)
@@ -1546,6 +2009,7 @@ func (a *app) applyConfig(cfg appconfig.Config, manifestAvailable bool) {
 func (a *app) configSnapshot() appconfig.Config {
 	return appconfig.Config{
 		SourceDir:        strings.TrimSpace(a.text(a.controls[idSourceEdit])),
+		FeedDir:          strings.TrimSpace(a.text(a.controls[idFeedEdit])),
 		TargetDir:        strings.TrimSpace(a.text(a.controls[idTargetEdit])),
 		Extensions:       strings.TrimSpace(a.text(a.controls[idExtensions])),
 		StartYear:        clamp(a.intFromControl(a.controls[idStartYear], time.Now().Year()), 1000, 9999),
@@ -1557,7 +2021,11 @@ func (a *app) configSnapshot() appconfig.Config {
 
 func (a *app) saveConfigAsync() {
 	sequence, cfg := a.configSaveRequest()
-	go a.writeConfig(sequence, cfg)
+	go func() {
+		if err := a.writeConfig(sequence, cfg); err != nil {
+			a.reportConfigSaveError(err)
+		}
+	}()
 }
 
 func (a *app) configSaveRequest() (uint64, appconfig.Config) {
@@ -1565,14 +2033,39 @@ func (a *app) configSaveRequest() (uint64, appconfig.Config) {
 	return a.configSequence, a.configSnapshot()
 }
 
-func (a *app) writeConfig(sequence uint64, cfg appconfig.Config) {
+func (a *app) writeConfig(sequence uint64, cfg appconfig.Config) error {
 	a.configWriteMu.Lock()
 	defer a.configWriteMu.Unlock()
 	if sequence < a.configWritten {
+		return nil
+	}
+	// Mark the newest attempted snapshot before writing so an older goroutine
+	// cannot overwrite it if this save fails.
+	a.configWritten = sequence
+	if err := appconfig.Save(cfg); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (a *app) reportConfigSaveError(err error) {
+	if err == nil {
 		return
 	}
-	a.configWritten = sequence
-	_ = appconfig.Save(cfg)
+	a.mu.Lock()
+	a.pendingConfigSaveErr = err
+	a.mu.Unlock()
+	win.PostMessage(a.hwnd, wmConfigSaveFailed, 0, 0)
+}
+
+func (a *app) finishConfigSaveFailed() {
+	a.mu.Lock()
+	err := a.pendingConfigSaveErr
+	a.pendingConfigSaveErr = nil
+	a.mu.Unlock()
+	if err != nil {
+		a.log("配置保存失败: " + err.Error())
+	}
 }
 
 func (a *app) currentTotalFiles() int {

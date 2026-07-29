@@ -7,6 +7,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 )
 
 type UndoSummary struct {
@@ -18,11 +19,16 @@ type UndoSummary struct {
 }
 
 func ManifestHasUndoableItems(path string) bool {
+	available, _ := CheckManifestUndoable(path)
+	return available
+}
+
+func CheckManifestUndoable(path string) (bool, error) {
 	if strings.TrimSpace(path) == "" {
-		return false
+		return false, nil
 	}
-	items, err := readManifestItems(path)
-	return err == nil && len(items) > 0
+	items, pendingRecovery, err := readManifestState(context.Background(), path)
+	return len(items) > 0 || pendingRecovery, err
 }
 
 func UndoManifest(ctx context.Context, manifestPath string, onProgress func(MoveProgress)) UndoSummary {
@@ -31,8 +37,12 @@ func UndoManifest(ctx context.Context, manifestPath string, onProgress func(Move
 
 func UndoManifestWithOptions(ctx context.Context, manifestPath string, opts MoveOptions, onProgress func(MoveProgress)) UndoSummary {
 	summary := UndoSummary{}
-	items, err := readManifestItems(manifestPath)
+	items, err := readManifestItems(ctx, manifestPath)
 	if err != nil {
+		if ctx != nil && ctx.Err() != nil {
+			summary.Cancelled = true
+			return summary
+		}
 		summary.Failed = 1
 		summary.Error = err.Error()
 		return summary
@@ -57,22 +67,23 @@ func UndoManifestWithOptions(ctx context.Context, manifestPath string, opts Move
 			SourcePath: items[i].TargetPath,
 			TargetPath: items[i].SourcePath,
 			Size:       items[i].Size,
+			ModTime:    items[i].ModTime,
 			Status:     "planned",
 		}
 		var info os.FileInfo
-		statErr := retryIOPaths(ctx, 3, []string{item.SourcePath}, func() error {
+		statErr := retryIOPathsWithMissing(ctx, 3, []string{item.SourcePath}, true, func() error {
 			var err error
 			info, err = os.Stat(fsPath(item.SourcePath))
 			return err
 		})
 		if os.IsNotExist(statErr) {
 			var restoredInfo os.FileInfo
-			restoredErr := retryIOPaths(ctx, 3, []string{item.TargetPath}, func() error {
+			restoredErr := retryIOPathsWithMissing(ctx, 3, []string{item.TargetPath}, true, func() error {
 				var err error
 				restoredInfo, err = os.Stat(fsPath(item.TargetPath))
 				return err
 			})
-			if restoredErr == nil && restoredInfo.Size() == item.Size {
+			if restoredErr == nil && manifestItemMatches(restoredInfo, item) {
 				summary.Restored++
 				if onProgress != nil {
 					onProgress(MoveProgress{Index: summary.Restored + summary.Failed, Total: summary.Total,
@@ -81,8 +92,9 @@ func UndoManifestWithOptions(ctx context.Context, manifestPath string, opts Move
 				continue
 			}
 		}
-		if statErr == nil && info.Size() != item.Size {
-			statErr = fmt.Errorf("archived file size changed: got %d, want %d", info.Size(), item.Size)
+		if statErr == nil && !manifestItemMatches(info, item) {
+			statErr = fmt.Errorf("archived file metadata changed: size %d, time %s; want size %d, time %s",
+				info.Size(), info.ModTime().Format(time.RFC3339Nano), item.Size, formatManifestTime(item.ModTime))
 		}
 		if statErr != nil {
 			summary.Failed++
@@ -121,38 +133,198 @@ func UndoManifestWithOptions(ctx context.Context, manifestPath string, opts Move
 	return summary
 }
 
-func readManifestItems(path string) ([]MovePlanItem, error) {
-	file, err := os.Open(fsPath(path))
+func readManifestItems(ctx context.Context, path string) ([]MovePlanItem, error) {
+	items, _, err := readManifestState(ctx, path)
+	return items, err
+}
+
+func readManifestState(ctx context.Context, path string) ([]MovePlanItem, bool, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	var file *os.File
+	err := retryIOPathsWithMissing(ctx, 3, []string{path}, true, func() error {
+		var openErr error
+		file, openErr = os.Open(fsPath(path))
+		return openErr
+	})
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	defer file.Close()
 
 	var items []MovePlanItem
+	pending := make(map[string]MovePlanItem)
+	var pendingOrder []string
+	completed := make(map[string]struct{})
 	scanner := bufio.NewScanner(file)
 	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
 	first := true
+	lineNumber := 0
+	manifestColumns := 0
 	for scanner.Scan() {
+		lineNumber++
+		if err := ctx.Err(); err != nil {
+			return items, len(pending) > 0, err
+		}
 		line := scanner.Text()
 		if first {
 			first = false
+			header := strings.Split(line, "\t")
+			if (len(header) != 6 && len(header) != 7) || header[0] != "status" || header[1] != "source" ||
+				header[2] != "target" || header[3] != "size" {
+				return items, len(pending) > 0, fmt.Errorf("invalid manifest header")
+			}
+			if len(header) == 7 && header[6] != "mod_time_rfc3339_nano" && header[6] != "mod_time_unix_nano" {
+				return items, len(pending) > 0, fmt.Errorf("invalid manifest modification-time column")
+			}
+			manifestColumns = len(header)
+			continue
+		}
+		if strings.TrimSpace(line) == "" {
 			continue
 		}
 		parts := strings.Split(line, "\t")
-		if len(parts) < 6 {
-			continue
+		if len(parts) != manifestColumns {
+			return items, len(pending) > 0, fmt.Errorf("invalid manifest row %d: got %d columns, expected %d",
+				lineNumber, len(parts), manifestColumns)
 		}
 		status := parts[0]
-		if status != "moved" && status != "copied" {
-			continue
+		switch status {
+		case "pending", "moved", "copied", "error", "cancelled":
+		default:
+			return items, len(pending) > 0, fmt.Errorf("invalid manifest row %d: unknown status %q", lineNumber, status)
 		}
-		size, _ := strconv.ParseInt(parts[3], 10, 64)
-		items = append(items, MovePlanItem{
+		if (status == "pending" || status == "moved" || status == "copied") &&
+			(strings.TrimSpace(parts[1]) == "" || strings.TrimSpace(parts[2]) == "") {
+			return items, len(pending) > 0, fmt.Errorf("invalid manifest row %d: source or target is empty", lineNumber)
+		}
+		size, sizeErr := strconv.ParseInt(parts[3], 10, 64)
+		if sizeErr != nil || size < 0 {
+			return items, len(pending) > 0, fmt.Errorf("invalid manifest row %d: invalid size %q", lineNumber, parts[3])
+		}
+		item := MovePlanItem{
 			Status:     status,
 			SourcePath: parts[1],
 			TargetPath: parts[2],
 			Size:       size,
-		})
+		}
+		if manifestColumns == 7 {
+			parsed, parseErr := parseManifestTime(parts[6])
+			if parseErr != nil {
+				return items, len(pending) > 0, fmt.Errorf("invalid manifest row %d: invalid modification time %q", lineNumber, parts[6])
+			}
+			item.ModTime = parsed
+		}
+		key := manifestItemKey(item)
+		switch status {
+		case "pending":
+			if _, exists := pending[key]; !exists {
+				pendingOrder = append(pendingOrder, key)
+			}
+			pending[key] = item
+		case "moved", "copied":
+			if _, exists := completed[key]; !exists {
+				items = append(items, item)
+				completed[key] = struct{}{}
+			}
+			delete(pending, key)
+		case "error", "cancelled":
+			delete(pending, key)
+		}
 	}
-	return items, scanner.Err()
+	if first {
+		return items, len(pending) > 0, fmt.Errorf("invalid manifest header")
+	}
+	if err := scanner.Err(); err != nil {
+		return items, len(pending) > 0, err
+	}
+
+	var recoveryErrors []string
+	for _, key := range pendingOrder {
+		item, exists := pending[key]
+		if !exists {
+			continue
+		}
+		recovered, recoveryErr := recoverPendingManifestItem(ctx, item)
+		if recoveryErr != nil {
+			recoveryErrors = append(recoveryErrors, recoveryErr.Error())
+			continue
+		}
+		if recovered {
+			item.Status = "recovered_pending"
+			items = append(items, item)
+		}
+	}
+	if len(recoveryErrors) > 0 {
+		return items, true, fmt.Errorf("manifest has ambiguous pending operations: %s", strings.Join(recoveryErrors, "; "))
+	}
+	return items, false, nil
+}
+
+func parseManifestTime(value string) (time.Time, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return time.Time{}, nil
+	}
+	if parsed, err := time.Parse(time.RFC3339Nano, value); err == nil {
+		return parsed.UTC(), nil
+	}
+	nanos, err := strconv.ParseInt(value, 10, 64)
+	if err != nil {
+		return time.Time{}, err
+	}
+	return time.Unix(0, nanos).UTC(), nil
+}
+
+func manifestItemKey(item MovePlanItem) string {
+	return strings.ToLower(displayPath(item.SourcePath)) + "\x00" +
+		strings.ToLower(displayPath(item.TargetPath)) + "\x00" + strconv.FormatInt(item.Size, 10)
+}
+
+func recoverPendingManifestItem(ctx context.Context, item MovePlanItem) (bool, error) {
+	var sourceInfo os.FileInfo
+	sourceErr := retryIOPathsWithMissing(ctx, 3, []string{item.SourcePath}, true, func() error {
+		var statErr error
+		sourceInfo, statErr = os.Stat(fsPath(item.SourcePath))
+		return statErr
+	})
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	var targetInfo os.FileInfo
+	targetErr := retryIOPathsWithMissing(ctx, 3, []string{item.TargetPath}, true, func() error {
+		var statErr error
+		targetInfo, statErr = os.Stat(fsPath(item.TargetPath))
+		return statErr
+	})
+	sourceExists := sourceErr == nil
+	targetExists := targetErr == nil
+	if sourceErr != nil && !os.IsNotExist(sourceErr) {
+		return false, fmt.Errorf("cannot inspect pending source %s: %w", item.SourcePath, sourceErr)
+	}
+	if targetErr != nil && !os.IsNotExist(targetErr) {
+		return false, fmt.Errorf("cannot inspect pending target %s: %w", item.TargetPath, targetErr)
+	}
+	if !sourceExists && targetExists && manifestItemMatches(targetInfo, item) {
+		return true, nil
+	}
+	if sourceExists && !targetExists && manifestItemMatches(sourceInfo, item) {
+		return false, nil
+	}
+	return false, fmt.Errorf("cannot determine pending move state: %s -> %s", item.SourcePath, item.TargetPath)
+}
+
+func manifestItemMatches(info os.FileInfo, item MovePlanItem) bool {
+	if info == nil || info.IsDir() || info.Size() != item.Size {
+		return false
+	}
+	return item.ModTime.IsZero() || info.ModTime().Equal(item.ModTime)
+}
+
+func formatManifestTime(value time.Time) string {
+	if value.IsZero() {
+		return "(not recorded)"
+	}
+	return value.Format(time.RFC3339Nano)
 }
