@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -36,6 +37,13 @@ type MoveSummary struct {
 }
 
 var errTargetCapacityChanged = errors.New("target directory capacity changed after dry-run")
+
+var copyBufferPool = sync.Pool{
+	New: func() any {
+		buffer := make([]byte, 8*1024*1024)
+		return &buffer
+	},
+}
 
 func ExecuteMovePlan(ctx context.Context, plan MovePlan, opts MoveOptions, onProgress func(MoveProgress)) MoveSummary {
 	summary := MoveSummary{Total: len(plan.Items)}
@@ -249,10 +257,19 @@ func moveOne(ctx context.Context, item MovePlanItem) (string, error) {
 		return "error", err
 	}
 
-	if err := retryIOPathsWithMissing(ctx, 2, []string{item.SourcePath, item.TargetPath}, true, func() error {
-		return os.Rename(fsPath(item.SourcePath), fsPath(item.TargetPath))
-	}); err == nil {
+	if err := ctx.Err(); err != nil {
+		return "error", err
+	}
+	renameErr := os.Rename(fsPath(item.SourcePath), fsPath(item.TargetPath))
+	if renameErr == nil {
 		return "moved", nil
+	}
+	if !isCrossDeviceError(renameErr) {
+		if err := retryIOPathsWithMissing(ctx, 2, []string{item.SourcePath, item.TargetPath}, true, func() error {
+			return os.Rename(fsPath(item.SourcePath), fsPath(item.TargetPath))
+		}); err == nil {
+			return "moved", nil
+		}
 	}
 
 	if err := copyVerifyDelete(ctx, item.SourcePath, item.TargetPath, sourceInfo); err != nil {
@@ -286,16 +303,11 @@ func copyVerifyDeleteWithHooks(ctx context.Context, sourcePath, targetPath strin
 		return err
 	}
 	_, copyErr := copyWithContext(ctx, target, source)
-	syncErr := retryIOPaths(ctx, 3, []string{targetPath}, target.Sync)
 	sourceCloseErr := source.Close()
 	closeErr := target.Close()
 	if copyErr != nil {
 		_ = os.Remove(fsPath(targetPath))
 		return copyErr
-	}
-	if syncErr != nil {
-		_ = os.Remove(fsPath(targetPath))
-		return syncErr
 	}
 	if closeErr != nil {
 		_ = os.Remove(fsPath(targetPath))
@@ -384,7 +396,12 @@ func syncExistingFile(ctx context.Context, path string) error {
 }
 
 func copyWithContext(ctx context.Context, dst io.Writer, src io.Reader) (int64, error) {
-	buf := make([]byte, 1024*1024)
+	// Moves are sequential, so this improves SMB throughput without
+	// multiplying memory use across concurrent copies. Reuse the allocation
+	// so batches of small files do not create an 8 MiB garbage object each.
+	buffer := copyBufferPool.Get().(*[]byte)
+	buf := *buffer
+	defer copyBufferPool.Put(buffer)
 	var written int64
 	for {
 		if ctx != nil && ctx.Err() != nil {

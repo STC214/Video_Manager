@@ -1,13 +1,17 @@
 package archive
 
 import (
+	"errors"
 	"path/filepath"
 	"strings"
 	"syscall"
 	"unsafe"
 )
 
-const driveRemote = 4
+const (
+	driveRemote        = 4
+	errorNotSameDevice = syscall.Errno(17)
+)
 
 func fsPath(path string) string {
 	path = filepath.Clean(strings.TrimSpace(path))
@@ -68,6 +72,10 @@ func IsLikelyNetworkPath(path string) bool {
 		return ret == driveRemote
 	}
 	return false
+}
+
+func isCrossDeviceError(err error) bool {
+	return errors.Is(err, errorNotSameDevice)
 }
 
 var (

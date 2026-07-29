@@ -584,3 +584,33 @@ func TestExecuteMovePlanRejectsSourceChangedAfterDryRun(t *testing.T) {
 		t.Fatalf("changed source must remain: %v", err)
 	}
 }
+
+func TestMoveOneHonorsCancellationBeforeRename(t *testing.T) {
+	root := t.TempDir()
+	source := filepath.Join(root, "source.mp4")
+	target := filepath.Join(root, "target.mp4")
+	if err := os.WriteFile(source, []byte("video"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	if _, err := moveOne(ctx, MovePlanItem{
+		SourcePath: source,
+		TargetPath: target,
+		Size:       info.Size(),
+		ModTime:    info.ModTime(),
+		Status:     "planned",
+	}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("move error = %v, want context cancellation", err)
+	}
+	if _, err := os.Stat(source); err != nil {
+		t.Fatalf("cancelled move changed source: %v", err)
+	}
+	if _, err := os.Stat(target); !os.IsNotExist(err) {
+		t.Fatalf("cancelled move created target: %v", err)
+	}
+}

@@ -1,6 +1,20 @@
 package archive
 
-import "testing"
+import (
+	"fmt"
+	"syscall"
+	"testing"
+)
+
+func TestIsCrossDeviceErrorRecognizesWrappedWindowsError(t *testing.T) {
+	err := fmt.Errorf("rename failed: %w", syscall.Errno(17))
+	if !isCrossDeviceError(err) {
+		t.Fatal("wrapped ERROR_NOT_SAME_DEVICE was not recognized")
+	}
+	if isCrossDeviceError(syscall.Errno(5)) {
+		t.Fatal("access denied was incorrectly classified as cross-device")
+	}
+}
 
 func TestIsLikelyNetworkPathUNC(t *testing.T) {
 	if !IsLikelyNetworkPath(`\\router\share\Videos`) {

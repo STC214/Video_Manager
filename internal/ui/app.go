@@ -48,17 +48,20 @@ const (
 	idLevelNameBase   = 1100
 	idLevelFolderBase = 1200
 
-	wmScanComplete   = win.WM_APP + 1
-	wmMoveProgress   = win.WM_APP + 2
-	wmMoveComplete   = win.WM_APP + 3
-	wmUndoComplete   = win.WM_APP + 4
-	wmScanProgress   = win.WM_APP + 5
-	wmDryRunDone     = win.WM_APP + 6
-	wmAppInit        = win.WM_APP + 7
-	wmConfigLoaded   = win.WM_APP + 8
-	wmCloseReady     = win.WM_APP + 9
-	wmDryRunProgress = win.WM_APP + 10
-	maxLevels        = 5
+	wmScanComplete     = win.WM_APP + 1
+	wmMoveProgress     = win.WM_APP + 2
+	wmMoveComplete     = win.WM_APP + 3
+	wmUndoComplete     = win.WM_APP + 4
+	wmScanProgress     = win.WM_APP + 5
+	wmDryRunDone       = win.WM_APP + 6
+	wmAppInit          = win.WM_APP + 7
+	wmConfigLoaded     = win.WM_APP + 8
+	wmCloseReady       = win.WM_APP + 9
+	wmDryRunProgress   = win.WM_APP + 10
+	wmBrowseDone       = win.WM_APP + 11
+	wmManifestChecked  = win.WM_APP + 12
+	wmConfigSaveFailed = win.WM_APP + 13
+	maxLevels          = 5
 
 	bifReturnOnlyFSDirs = 0x0001
 	bifNewDialogStyle   = 0x0040
@@ -99,6 +102,7 @@ var (
 	buttonBrush  win.HBRUSH
 	pressedBrush win.HBRUSH
 	font         win.HFONT
+	contentFont  win.HFONT
 
 	startupTraceOnce sync.Once
 	startupTraceCh   = make(chan string, 256)
@@ -121,6 +125,8 @@ type app struct {
 	moveStatus               string
 	moveDone                 int
 	moveTotal                int
+	moveNetwork              bool
+	moveProgressBusy         bool
 	moveCancel               context.CancelFunc
 	scanCancel               context.CancelFunc
 	scanStatus               string
@@ -130,6 +136,14 @@ type app struct {
 	dryRunError              string
 	dryRunLines              []string
 	dryRunPage               int
+	dryRunNetwork            bool
+	browsing                 bool
+	browseKind               int
+	browsePath               string
+	browseOldSource          string
+	browseOldTarget          string
+	browseThreadID           uint32
+	browseCancelRequested    bool
 	progressTotal            int
 	progressBusy             bool
 	lastManifest             string
@@ -145,6 +159,10 @@ type app struct {
 	configWritten            uint64
 	pendingConfig            appconfig.Config
 	pendingManifestAvailable bool
+	pendingManifestCheckErr  error
+	pendingManifestPath      string
+	pendingConfigSaveErr     error
+	manifestCheckNetwork     bool
 	configLoadErr            error
 	configEdited             bool
 	closing                  bool
@@ -182,6 +200,7 @@ func Run() {
 	buttonBrush = createSolidBrush(colorButton)
 	pressedBrush = createSolidBrush(colorPressed)
 	font = createUIFont()
+	contentFont = createContentFont()
 	bigIcon, bigIconOwned := loadAppIcon(a.instance, win.GetSystemMetrics(win.SM_CXICON))
 	smallIcon, smallIconOwned := loadAppIcon(a.instance, win.GetSystemMetrics(win.SM_CXSMICON))
 	startupTrace("Run: gdi resources created")
@@ -194,6 +213,9 @@ func Run() {
 		win.DeleteObject(win.HGDIOBJ(pressedBrush))
 		if font != 0 {
 			win.DeleteObject(win.HGDIOBJ(font))
+		}
+		if contentFont != 0 {
+			win.DeleteObject(win.HGDIOBJ(contentFont))
 		}
 		if bigIconOwned && bigIcon != 0 {
 			win.DestroyIcon(bigIcon)
@@ -297,10 +319,9 @@ func wndProc(hwnd win.HWND, msg uint32, wParam, lParam uintptr) uintptr {
 			startupTrace("APP_INIT: recalculate done")
 			go func() {
 				cfg, err := appconfig.Load()
-				manifestAvailable := err == nil && archive.ManifestHasUndoableItems(cfg.LastManifest)
 				a.mu.Lock()
 				a.pendingConfig = cfg
-				a.pendingManifestAvailable = manifestAvailable
+				a.pendingManifestAvailable = false
 				a.configLoadErr = err
 				a.mu.Unlock()
 				win.PostMessage(a.hwnd, wmConfigLoaded, 0, 0)
@@ -309,6 +330,18 @@ func wndProc(hwnd win.HWND, msg uint32, wParam, lParam uintptr) uintptr {
 	case wmConfigLoaded:
 		if a != nil {
 			a.finishConfigLoad()
+		}
+	case wmManifestChecked:
+		if a != nil {
+			a.finishManifestCheck()
+		}
+	case wmConfigSaveFailed:
+		if a != nil {
+			a.finishConfigSaveFailed()
+		}
+	case wmBrowseDone:
+		if a != nil {
+			a.finishBrowse()
 		}
 	case wmCloseReady:
 		win.DestroyWindow(hwnd)
@@ -429,17 +462,19 @@ func (a *app) createControls() {
 	}
 
 	a.label("计算结果", 500, 252, 120, 24)
-	a.controls[idResult] = a.textArea(idResult, 500, 279, 525, 145, false)
+	a.controls[idResult] = a.textArea(idResult, 500, 279, 525, 145)
 	a.setReadOnly(a.controls[idResult])
 
 	a.label("预览", 24, 450, 90, 24)
 	a.button(idPreviewPrev, "上一页", 360, 444, 68, 28)
 	a.button(idPreviewNext, "下一页", 436, 444, 68, 28)
-	a.controls[idPreview] = a.textArea(idPreview, 24, 476, 490, 180, true)
+	a.controls[idPreview] = a.textArea(idPreview, 24, 476, 490, 180)
+	a.applyContentFont(a.controls[idPreview])
 	a.setReadOnly(a.controls[idPreview])
 
 	a.label("日志", 526, 450, 90, 24)
-	a.controls[idLog] = a.textArea(idLog, 526, 476, 499, 180, true)
+	a.controls[idLog] = a.textArea(idLog, 526, 476, 499, 180)
+	a.applyContentFont(a.controls[idLog])
 	a.setReadOnly(a.controls[idLog])
 
 	for _, preset := range archive.NamingPresets {
@@ -487,22 +522,12 @@ func (a *app) handleCommand(wParam, lParam uintptr) {
 		if code == win.BN_CLICKED {
 			current := strings.TrimSpace(a.text(a.controls[idSourceEdit]))
 			oldTarget := strings.TrimSpace(a.text(a.controls[idTargetEdit]))
-			if path := browseFolder(a.hwnd, "选择视频源目录", current); path != "" {
-				a.setText(a.controls[idSourceEdit], path)
-				if shouldFollowSourceTarget(current, oldTarget) {
-					a.setText(a.controls[idTargetEdit], filepath.Join(path, "_Archived"))
-				}
-				a.log("已选择源目录: " + path)
-				a.log("当前目标目录: " + strings.TrimSpace(a.text(a.controls[idTargetEdit])))
-			}
+			a.startBrowse(idBrowse, "选择视频源目录", current, current, oldTarget)
 		}
 	case idBrowseTarget:
 		if code == win.BN_CLICKED {
 			current := strings.TrimSpace(a.text(a.controls[idTargetEdit]))
-			if path := browseFolder(a.hwnd, "选择归档目标目录", current); path != "" {
-				a.setText(a.controls[idTargetEdit], path)
-				a.log("已选择目标目录: " + path)
-			}
+			a.startBrowse(idBrowseTarget, "选择归档目标目录", current, "", "")
 		}
 	case idScan:
 		if code == win.BN_CLICKED {
@@ -573,6 +598,87 @@ func shouldFollowSourceTarget(oldSource, oldTarget string) bool {
 	}
 	expected := filepath.Join(oldSource, "_Archived")
 	return archive.SamePath(oldTarget, expected)
+}
+
+func (a *app) startBrowse(kind int, title, initialPath, oldSource, oldTarget string) {
+	a.mu.Lock()
+	if a.browsing || a.scanning || a.dryRunning || a.moving {
+		a.mu.Unlock()
+		return
+	}
+	a.browsing = true
+	a.browseKind = kind
+	a.browsePath = ""
+	a.browseOldSource = oldSource
+	a.browseOldTarget = oldTarget
+	a.browseThreadID = 0
+	a.browseCancelRequested = false
+	a.configEdited = true
+	a.mu.Unlock()
+
+	a.setConfigurationEnabled(false)
+	a.setActionState(false, false, false, true, false)
+	a.setProgressBusy(true)
+	a.log("正在打开目录选择器……")
+
+	go func() {
+		runtime.LockOSThread()
+		defer runtime.UnlockOSThread()
+		threadID := currentThreadID()
+		a.mu.Lock()
+		a.browseThreadID = threadID
+		a.mu.Unlock()
+		path := browseFolder(0, title, initialPath)
+		a.mu.Lock()
+		if !a.browseCancelRequested {
+			a.browsePath = path
+		}
+		a.mu.Unlock()
+		win.PostMessage(a.hwnd, wmBrowseDone, 0, 0)
+	}()
+}
+
+func (a *app) finishBrowse() {
+	a.mu.Lock()
+	kind := a.browseKind
+	path := a.browsePath
+	oldSource := a.browseOldSource
+	oldTarget := a.browseOldTarget
+	cancelled := a.browseCancelRequested
+	a.browsing = false
+	a.browseKind = 0
+	a.browsePath = ""
+	a.browseThreadID = 0
+	a.browseCancelRequested = false
+	hasScan := len(a.scanResult.Files) > 0 && a.scanResult.ErrorCount == 0 && !a.scanResult.Cancelled
+	hasPlan := len(a.currentPlan.Items) > 0 && a.currentPlan.ErrorCount == 0
+	hasManifest := a.lastManifestAvailable
+	closing := a.closing
+	a.mu.Unlock()
+
+	a.setProgressBusy(false)
+	a.setProgress(0, 1)
+	if closing {
+		a.maybeFinishClose()
+		return
+	}
+	a.setConfigurationEnabled(true)
+	a.setActionState(true, hasScan, hasPlan, false, hasManifest)
+	if cancelled || path == "" {
+		a.log("已取消目录选择。")
+		return
+	}
+	if kind == idBrowse {
+		a.setText(a.controls[idSourceEdit], path)
+		if shouldFollowSourceTarget(oldSource, oldTarget) {
+			a.setText(a.controls[idTargetEdit], filepath.Join(path, "_Archived"))
+		}
+		a.log("已选择源目录: " + path)
+		a.log("当前目标目录: " + strings.TrimSpace(a.text(a.controls[idTargetEdit])))
+		return
+	}
+	a.setText(a.controls[idTargetEdit], path)
+	a.log("已选择目标目录: " + path)
 }
 
 func (a *app) invalidatePathDependentState() {
@@ -746,8 +852,9 @@ func (a *app) finishScan() {
 	result := a.scanResult
 	hasManifest := a.lastManifestAvailable
 	a.mu.Unlock()
+	hasUsableScan := len(result.Files) > 0 && result.ErrorCount == 0 && !result.Cancelled
 	a.setConfigurationEnabled(true)
-	a.setActionState(true, len(result.Files) > 0, false, false, hasManifest)
+	a.setActionState(true, hasUsableScan, false, false, hasManifest)
 
 	a.setText(a.controls[idCalculate], "重新计算")
 	a.setText(a.controls[idTotalFiles], strconv.Itoa(result.VideoCount))
@@ -784,6 +891,16 @@ func (a *app) generateDryRun() {
 	}
 	result := a.scanResult
 	a.mu.Unlock()
+	if result.Cancelled {
+		cancel()
+		a.log("上次扫描已取消，结果不完整；请重新扫描后再生成 Dry-run。")
+		return
+	}
+	if result.ErrorCount > 0 {
+		cancel()
+		a.log(fmt.Sprintf("上次扫描有 %d 个读取错误，结果不完整；请排除错误并重新扫描。", result.ErrorCount))
+		return
+	}
 	if len(result.Files) == 0 {
 		cancel()
 		a.log("没有可生成 dry-run 的扫描结果，请先扫描包含视频的目录。")
@@ -817,13 +934,21 @@ func (a *app) generateDryRun() {
 	a.mu.Unlock()
 	sourceRoot := strings.TrimSpace(a.text(a.controls[idSourceEdit]))
 	targetRoot := strings.TrimSpace(a.text(a.controls[idTargetEdit]))
-	if archive.IsLikelyNetworkPath(sourceRoot) || archive.IsLikelyNetworkPath(targetRoot) {
+	networkRead := archive.IsLikelyNetworkPath(sourceRoot) || archive.IsLikelyNetworkPath(targetRoot)
+	a.mu.Lock()
+	a.dryRunNetwork = networkRead
+	a.mu.Unlock()
+	if networkRead {
 		a.log("检测到网络路径，Dry-run 校验会给予 SMB/UNC 更长等待时间。")
 	}
 
 	a.setConfigurationEnabled(false)
 	a.setActionState(false, false, false, true, false)
-	a.setProgress(0, 4)
+	if networkRead {
+		a.setProgressBusy(true)
+	} else {
+		a.setProgress(0, 4)
+	}
 	a.setTextNoFlicker(a.controls[idPreview], "正在生成 Dry-run，请等待阶段进度完成……")
 	a.log("开始生成 Dry-run。")
 
@@ -927,7 +1052,17 @@ func (a *app) finishDryRun() {
 	itemCount := len(a.currentPlan.Items)
 	planErrors := a.currentPlan.ErrorCount
 	hasManifest := a.lastManifestAvailable
+	networkRead := a.dryRunNetwork
+	a.dryRunNetwork = false
 	a.mu.Unlock()
+	if networkRead {
+		a.setProgressBusy(false)
+		if errText == "" {
+			a.setProgress(4, 4)
+		} else {
+			a.setProgress(0, 4)
+		}
+	}
 	a.setConfigurationEnabled(true)
 	a.setActionState(true, true, errText == "" && itemCount > 0 && planErrors == 0, false, hasManifest)
 
@@ -971,7 +1106,12 @@ func (a *app) postDryRunProgress(done int) {
 }
 
 func (a *app) showDryRunProgress(done int) {
-	a.setProgress(done, 4)
+	a.mu.Lock()
+	networkRead := a.dryRunNetwork
+	a.mu.Unlock()
+	if !networkRead {
+		a.setProgress(done, 4)
+	}
 	status := dryRunProgressMessage(done)
 	if status != "" {
 		a.log(status)
@@ -1101,19 +1241,31 @@ func (a *app) startMove() {
 
 	sourceRoot := strings.TrimSpace(a.text(a.controls[idSourceEdit]))
 	targetRoot := strings.TrimSpace(a.text(a.controls[idTargetEdit]))
-	if archive.IsLikelyNetworkPath(sourceRoot) || archive.IsLikelyNetworkPath(targetRoot) || archive.IsLikelyNetworkPath(plan.TargetRoot) {
+	networkMove := archive.IsLikelyNetworkPath(sourceRoot) || archive.IsLikelyNetworkPath(targetRoot) || archive.IsLikelyNetworkPath(plan.TargetRoot)
+	a.mu.Lock()
+	a.moveNetwork = networkMove
+	a.moveProgressBusy = networkMove
+	if networkMove {
+		a.moveStatus = "正在初始化网络运行清单……"
+	}
+	a.mu.Unlock()
+	if networkMove {
+		a.setProgressBusy(true)
 		a.log("检测到网络路径，移动、复制和删除会使用更长重试等待；取消会在当前 I/O 或复制块结束后生效。")
 	}
 
 	go func() {
 		lastPost := time.Now().Add(-time.Second)
-		summary := archive.ExecuteMovePlan(ctx, plan, archive.MoveOptions{}, func(progress archive.MoveProgress) {
-			if time.Since(lastPost) < 250*time.Millisecond && progress.Index != progress.Total {
+		summary := archive.ExecuteMovePlan(ctx, plan, archive.MoveOptions{ReportItemStart: networkMove}, func(progress archive.MoveProgress) {
+			if progress.Status != "processing" && time.Since(lastPost) < 250*time.Millisecond && progress.Index != progress.Total {
 				return
 			}
 			lastPost = time.Now()
 			a.mu.Lock()
-			if progress.Error != "" {
+			a.moveProgressBusy = a.moveNetwork && progress.Status == "processing"
+			if progress.Status == "processing" {
+				a.moveStatus = fmt.Sprintf("正在处理网络文件 %d/%d: %s", progress.Index+1, progress.Total, progress.TargetPath)
+			} else if progress.Error != "" {
 				a.moveStatus = fmt.Sprintf("移动进度 %d/%d: %s - %s", progress.Index, progress.Total, progress.Status, progress.Error)
 			} else {
 				a.moveStatus = fmt.Sprintf("移动进度 %d/%d: %s", progress.Index, progress.Total, progress.TargetPath)
@@ -1124,17 +1276,26 @@ func (a *app) startMove() {
 			win.PostMessage(a.hwnd, wmMoveProgress, 0, 0)
 		})
 		if !summary.Cancelled && summary.Error == "" && summary.Moved > 0 && sourceRoot != "" {
+			if archive.IsLikelyNetworkPath(sourceRoot) {
+				a.mu.Lock()
+				a.moveProgressBusy = true
+				a.moveStatus = "正在读取网络源目录并清理空目录……"
+				a.mu.Unlock()
+				win.PostMessage(a.hwnd, wmMoveProgress, 0, 0)
+			}
 			removed, errs := archive.CleanupEmptyDirs(ctx, sourceRoot, []string{targetRoot})
 			if len(errs) > 0 {
 				a.mu.Lock()
 				a.moveStatus = fmt.Sprintf("空目录清理完成: 删除 %d 个，错误 %d 个", removed, len(errs))
 				a.mu.Unlock()
+				win.PostMessage(a.hwnd, wmMoveProgress, 0, 0)
 			}
 		}
 		a.mu.Lock()
 		a.moveSummary = summary
 		a.moving = false
 		a.moveCancel = nil
+		a.moveProgressBusy = false
 		a.mu.Unlock()
 		win.PostMessage(a.hwnd, wmMoveComplete, 0, 0)
 	}()
@@ -1142,6 +1303,7 @@ func (a *app) startMove() {
 
 func (a *app) cancelActiveTask() {
 	a.mu.Lock()
+	browsing := a.browsing
 	scanCancel := a.scanCancel
 	scanning := a.scanning
 	dryRunCancel := a.dryRunCancel
@@ -1149,6 +1311,10 @@ func (a *app) cancelActiveTask() {
 	cancel := a.moveCancel
 	moving := a.moving
 	a.mu.Unlock()
+	if browsing {
+		a.cancelBrowse()
+		return
+	}
 	if moving && cancel != nil {
 		cancel()
 		a.log("正在取消，当前文件操作结束后停止。")
@@ -1163,6 +1329,41 @@ func (a *app) cancelActiveTask() {
 		dryRunCancel()
 		a.log("正在取消 Dry-run。")
 	}
+}
+
+func (a *app) cancelBrowse() {
+	a.mu.Lock()
+	if !a.browsing {
+		a.mu.Unlock()
+		return
+	}
+	a.browseCancelRequested = true
+	a.mu.Unlock()
+	a.log("正在关闭目录选择器……")
+
+	go func() {
+		ticker := time.NewTicker(100 * time.Millisecond)
+		defer ticker.Stop()
+		timeout := time.NewTimer(5 * time.Second)
+		defer timeout.Stop()
+		for {
+			a.mu.Lock()
+			browsing := a.browsing
+			threadID := a.browseThreadID
+			a.mu.Unlock()
+			if !browsing {
+				return
+			}
+			if threadID != 0 {
+				closeThreadWindows(threadID)
+			}
+			select {
+			case <-ticker.C:
+			case <-timeout.C:
+				return
+			}
+		}
+	}()
 }
 
 func (a *app) cancelMove() {
@@ -1186,6 +1387,7 @@ func (a *app) requestClose() {
 	}
 	a.closing = true
 	a.cancelBackgroundTasks()
+	a.cancelBrowse()
 	a.maybeFinishClose()
 }
 
@@ -1194,7 +1396,7 @@ func (a *app) maybeFinishClose() {
 		return
 	}
 	a.mu.Lock()
-	active := a.scanning || a.dryRunning || a.moving
+	active := a.browsing || a.scanning || a.dryRunning || a.moving
 	a.mu.Unlock()
 	if active {
 		return
@@ -1202,7 +1404,9 @@ func (a *app) maybeFinishClose() {
 	a.closeSaveStarted = true
 	sequence, cfg := a.configSaveRequest()
 	go func() {
-		a.writeConfig(sequence, cfg)
+		if err := a.writeConfig(sequence, cfg); err != nil {
+			a.reportConfigSaveError(err)
+		}
 		win.PostMessage(a.hwnd, wmCloseReady, 0, 0)
 	}()
 }
@@ -1221,11 +1425,14 @@ func (a *app) showMoveProgress() {
 	status := a.moveStatus
 	done := a.moveDone
 	total := a.moveTotal
+	busy := a.moveProgressBusy
 	a.mu.Unlock()
 	if status != "" {
 		a.log(status)
 	}
-	if total > 0 {
+	if busy {
+		a.setProgressBusy(true)
+	} else if total > 0 {
 		a.setProgress(done, total)
 	}
 }
@@ -1242,6 +1449,8 @@ func (a *app) finishMove() {
 		a.lastManifestAvailable = true
 	}
 	hasManifest := a.lastManifestAvailable
+	a.moveNetwork = false
+	a.moveProgressBusy = false
 	a.mu.Unlock()
 	a.setConfigurationEnabled(true)
 	a.setActionState(true, false, false, false, hasManifest)
@@ -1288,27 +1497,38 @@ func (a *app) startUndo() {
 		return
 	}
 	ctx, cancel := context.WithCancel(context.Background())
+	networkUndo := archive.IsLikelyNetworkPath(manifest) ||
+		archive.IsLikelyNetworkPath(a.text(a.controls[idSourceEdit])) ||
+		archive.IsLikelyNetworkPath(a.text(a.controls[idTargetEdit]))
 	a.mu.Lock()
 	a.moving = true
 	a.moveCancel = cancel
 	a.moveStatus = "开始撤销..."
+	a.moveNetwork = networkUndo
+	a.moveProgressBusy = networkUndo
+	if networkUndo {
+		a.moveStatus = "正在读取网络运行清单……"
+	}
 	a.mu.Unlock()
 
 	a.setConfigurationEnabled(false)
 	a.setActionState(false, false, false, true, false)
-	a.setProgressBusy(false)
+	a.setProgressBusy(networkUndo)
 	a.setProgress(0, 1)
 	a.log("开始撤销最近一次移动。")
 
 	go func() {
 		lastPost := time.Now().Add(-time.Second)
-		summary := archive.UndoManifest(ctx, manifest, func(progress archive.MoveProgress) {
-			if time.Since(lastPost) < 250*time.Millisecond && progress.Index != progress.Total {
+		summary := archive.UndoManifestWithOptions(ctx, manifest, archive.MoveOptions{ReportItemStart: networkUndo}, func(progress archive.MoveProgress) {
+			if progress.Status != "processing" && time.Since(lastPost) < 250*time.Millisecond && progress.Index != progress.Total {
 				return
 			}
 			lastPost = time.Now()
 			a.mu.Lock()
-			if progress.Error != "" {
+			a.moveProgressBusy = a.moveNetwork && progress.Status == "processing"
+			if progress.Status == "processing" {
+				a.moveStatus = fmt.Sprintf("正在处理网络撤销 %d/%d: %s", progress.Index+1, progress.Total, progress.TargetPath)
+			} else if progress.Error != "" {
 				a.moveStatus = fmt.Sprintf("撤销进度 %d/%d: %s", progress.Index, progress.Total, progress.Error)
 			} else {
 				a.moveStatus = fmt.Sprintf("撤销进度 %d/%d: %s", progress.Index, progress.Total, progress.TargetPath)
@@ -1326,6 +1546,7 @@ func (a *app) startUndo() {
 		a.undoSummary = summary
 		a.moving = false
 		a.moveCancel = nil
+		a.moveProgressBusy = false
 		a.mu.Unlock()
 		win.PostMessage(a.hwnd, wmUndoComplete, 0, 0)
 	}()
@@ -1340,6 +1561,8 @@ func (a *app) finishUndo() {
 		a.lastManifestAvailable = false
 	}
 	hasPendingUndo := a.lastManifestAvailable
+	a.moveNetwork = false
+	a.moveProgressBusy = false
 	a.mu.Unlock()
 	a.setConfigurationEnabled(true)
 	a.setActionState(true, false, false, false, hasPendingUndo)
@@ -1408,6 +1631,73 @@ func (a *app) finishConfigLoad() {
 	a.applyConfig(cfg, manifestAvailable)
 	a.initializing = false
 	a.recalculate()
+	a.startManifestCheck(cfg.LastManifest)
+}
+
+func (a *app) startManifestCheck(manifest string) {
+	manifest = strings.TrimSpace(manifest)
+	if manifest == "" {
+		return
+	}
+	network := archive.IsLikelyNetworkPath(manifest)
+	a.mu.Lock()
+	a.manifestCheckNetwork = network
+	a.pendingManifestPath = manifest
+	a.pendingManifestAvailable = false
+	a.pendingManifestCheckErr = nil
+	a.mu.Unlock()
+	if network {
+		a.setProgressBusy(true)
+		a.log("正在后台检查网络运行清单，配置已先行加载……")
+	}
+	go func() {
+		available, err := archive.CheckManifestUndoable(manifest)
+		a.mu.Lock()
+		a.pendingManifestAvailable = available
+		a.pendingManifestCheckErr = err
+		a.mu.Unlock()
+		win.PostMessage(a.hwnd, wmManifestChecked, 0, 0)
+	}()
+}
+
+func (a *app) finishManifestCheck() {
+	a.mu.Lock()
+	manifest := a.pendingManifestPath
+	available := a.pendingManifestAvailable
+	checkErr := a.pendingManifestCheckErr
+	network := a.manifestCheckNetwork
+	active := a.scanning || a.dryRunning || a.moving
+	sameManifest := archive.SamePath(a.lastManifest, manifest)
+	closing := a.closing
+	if sameManifest {
+		a.lastManifestAvailable = available
+	}
+	a.pendingManifestPath = ""
+	a.pendingManifestCheckErr = nil
+	a.manifestCheckNetwork = false
+	a.mu.Unlock()
+	if closing {
+		return
+	}
+	if network && !active {
+		a.setProgressBusy(false)
+		a.setProgress(0, 1)
+	}
+	if !sameManifest {
+		return
+	}
+	win.EnableWindow(a.controls[idUndo], available && !active)
+	if checkErr != nil {
+		if available {
+			a.log("运行清单存在需要人工确认的恢复状态，撤销时将再次校验: " + checkErr.Error())
+		} else {
+			a.log("无法检查最近运行清单，撤销暂不可用: " + checkErr.Error())
+		}
+		return
+	}
+	if available {
+		a.log("最近运行清单检查完成，可以撤销。")
+	}
 }
 
 func (a *app) applyConfig(cfg appconfig.Config, manifestAvailable bool) {
@@ -1459,7 +1749,11 @@ func (a *app) configSnapshot() appconfig.Config {
 
 func (a *app) saveConfigAsync() {
 	sequence, cfg := a.configSaveRequest()
-	go a.writeConfig(sequence, cfg)
+	go func() {
+		if err := a.writeConfig(sequence, cfg); err != nil {
+			a.reportConfigSaveError(err)
+		}
+	}()
 }
 
 func (a *app) configSaveRequest() (uint64, appconfig.Config) {
@@ -1467,14 +1761,34 @@ func (a *app) configSaveRequest() (uint64, appconfig.Config) {
 	return a.configSequence, a.configSnapshot()
 }
 
-func (a *app) writeConfig(sequence uint64, cfg appconfig.Config) {
+func (a *app) writeConfig(sequence uint64, cfg appconfig.Config) error {
 	a.configWriteMu.Lock()
 	defer a.configWriteMu.Unlock()
 	if sequence < a.configWritten {
-		return
+		return nil
 	}
 	a.configWritten = sequence
-	_ = appconfig.Save(cfg)
+	return appconfig.Save(cfg)
+}
+
+func (a *app) reportConfigSaveError(err error) {
+	if err == nil {
+		return
+	}
+	a.mu.Lock()
+	a.pendingConfigSaveErr = err
+	a.mu.Unlock()
+	win.PostMessage(a.hwnd, wmConfigSaveFailed, 0, 0)
+}
+
+func (a *app) finishConfigSaveFailed() {
+	a.mu.Lock()
+	err := a.pendingConfigSaveErr
+	a.pendingConfigSaveErr = nil
+	a.mu.Unlock()
+	if err != nil {
+		a.log("配置保存失败: " + err.Error())
+	}
 }
 
 func (a *app) updateLevelVisibility() {
@@ -1541,12 +1855,9 @@ func (a *app) edit(id int, text string, x, y, w, h int32, number bool) win.HWND 
 	return hwnd
 }
 
-func (a *app) textArea(id int, x, y, w, h int32, horizontalScroll bool) win.HWND {
+func (a *app) textArea(id int, x, y, w, h int32) win.HWND {
 	style := uint32(win.WS_CHILD | win.WS_VISIBLE | win.WS_TABSTOP | win.WS_BORDER | win.WS_VSCROLL |
 		win.ES_MULTILINE | win.ES_AUTOVSCROLL | win.ES_NOHIDESEL)
-	if horizontalScroll {
-		style |= win.WS_HSCROLL | win.ES_AUTOHSCROLL
-	}
 	hwnd := win.CreateWindowEx(0, syscall.StringToUTF16Ptr("EDIT"), nil,
 		style, x, y, w, h, a.hwnd, win.HMENU(uintptr(id)), a.instance, nil)
 	a.applyFont(hwnd)
@@ -1668,6 +1979,12 @@ func (a *app) applyFont(hwnd win.HWND) {
 	if font != 0 {
 		// The parent is hidden during control creation; paint everything once on ShowWindow.
 		win.SendMessage(hwnd, win.WM_SETFONT, uintptr(font), 0)
+	}
+}
+
+func (a *app) applyContentFont(hwnd win.HWND) {
+	if contentFont != 0 {
+		win.SendMessage(hwnd, win.WM_SETFONT, uintptr(contentFont), 0)
 	}
 }
 
@@ -1834,8 +2151,16 @@ func rgb(r, g, b byte) win.COLORREF {
 }
 
 func createUIFont() win.HFONT {
+	return createUIFontWithHeight(-16)
+}
+
+func createContentFont() win.HFONT {
+	return createUIFontWithHeight(-14)
+}
+
+func createUIFontWithHeight(height int32) win.HFONT {
 	var lf win.LOGFONT
-	lf.LfHeight = -16
+	lf.LfHeight = height
 	lf.LfWeight = win.FW_NORMAL
 	lf.LfCharSet = win.DEFAULT_CHARSET
 	lf.LfOutPrecision = win.OUT_DEFAULT_PRECIS
@@ -2014,16 +2339,39 @@ var (
 	procGetTextLength                           = user32.NewProc("GetWindowTextLengthW")
 	procSetWindowText                           = user32.NewProc("SetWindowTextW")
 	procFillRect                                = user32.NewProc("FillRect")
+	procEnumThreadWindows                       = user32.NewProc("EnumThreadWindows")
 	procCreateSolidBrush                        = gdi32.NewProc("CreateSolidBrush")
 	procSHGetPathFromIDListEx                   = shell32.NewProc("SHGetPathFromIDListEx")
 	procSHCreateItemFromParsingName             = shell32.NewProc("SHCreateItemFromParsingName")
 	procSetCurrentProcessExplicitAppUserModelID = shell32.NewProc("SetCurrentProcessExplicitAppUserModelID")
 	procGetCurrentThreadID                      = syscall.NewLazyDLL("kernel32.dll").NewProc("GetCurrentThreadId")
+	enumCloseWindowCallback                     = syscall.NewCallback(enumCloseWindow)
 )
 
 func currentThreadID() uint32 {
 	ret, _, _ := procGetCurrentThreadID.Call()
 	return uint32(ret)
+}
+
+func closeThreadWindows(threadID uint32) bool {
+	if threadID == 0 {
+		return false
+	}
+	found := false
+	procEnumThreadWindows.Call(
+		uintptr(threadID),
+		enumCloseWindowCallback,
+		uintptr(unsafe.Pointer(&found)),
+	)
+	return found
+}
+
+func enumCloseWindow(hwnd win.HWND, lParam uintptr) uintptr {
+	if hwnd != 0 {
+		*(*bool)(unsafe.Pointer(lParam)) = true
+		win.PostMessage(hwnd, win.WM_CLOSE, 0, 0)
+	}
+	return 1
 }
 
 func createSolidBrush(color win.COLORREF) win.HBRUSH {

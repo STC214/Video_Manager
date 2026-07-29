@@ -103,6 +103,7 @@ var (
 	buttonBrush  win.HBRUSH
 	pressedBrush win.HBRUSH
 	font         win.HFONT
+	contentFont  win.HFONT
 
 	startupTraceOnce sync.Once
 	startupTraceCh   = make(chan string, 256)
@@ -196,6 +197,7 @@ func Run() {
 	buttonBrush = createSolidBrush(colorButton)
 	pressedBrush = createSolidBrush(colorPressed)
 	font = createUIFont()
+	contentFont = createContentFont()
 	bigIcon, bigIconOwned := loadAppIcon(a.instance, win.GetSystemMetrics(win.SM_CXICON))
 	smallIcon, smallIconOwned := loadAppIcon(a.instance, win.GetSystemMetrics(win.SM_CXSMICON))
 	startupTrace("Run: gdi resources created")
@@ -208,6 +210,9 @@ func Run() {
 		win.DeleteObject(win.HGDIOBJ(pressedBrush))
 		if font != 0 {
 			win.DeleteObject(win.HGDIOBJ(font))
+		}
+		if contentFont != 0 {
+			win.DeleteObject(win.HGDIOBJ(contentFont))
 		}
 		if bigIconOwned && bigIcon != 0 {
 			win.DestroyIcon(bigIcon)
@@ -450,17 +455,19 @@ func (a *app) createControls() {
 	a.label("目录规则", 24, 288, 90, 24)
 	a.label("YYYY  →  YYYYS1..S4  →  YYYYMM  →  YYYYMMNN", 115, 288, 360, 24)
 	a.label("计算结果", 500, 288, 120, 24)
-	a.controls[idResult] = a.textArea(idResult, 500, 315, 525, 145, false)
+	a.controls[idResult] = a.textArea(idResult, 500, 315, 525, 145)
 	a.setReadOnly(a.controls[idResult])
 
 	a.label("预览", 24, 486, 90, 24)
 	a.button(idPreviewPrev, "上一页", 360, 480, 68, 28)
 	a.button(idPreviewNext, "下一页", 436, 480, 68, 28)
-	a.controls[idPreview] = a.textArea(idPreview, 24, 512, 490, 180, true)
+	a.controls[idPreview] = a.textArea(idPreview, 24, 512, 490, 180)
+	a.applyContentFont(a.controls[idPreview])
 	a.setReadOnly(a.controls[idPreview])
 
 	a.label("日志", 526, 486, 90, 24)
-	a.controls[idLog] = a.textArea(idLog, 526, 512, 499, 180, true)
+	a.controls[idLog] = a.textArea(idLog, 526, 512, 499, 180)
+	a.applyContentFont(a.controls[idLog])
 	a.setReadOnly(a.controls[idLog])
 
 	a.setText(a.controls[idCalculate], "重新计算")
@@ -2101,12 +2108,9 @@ func (a *app) edit(id int, text string, x, y, w, h int32, number bool) win.HWND 
 	return hwnd
 }
 
-func (a *app) textArea(id int, x, y, w, h int32, horizontalScroll bool) win.HWND {
+func (a *app) textArea(id int, x, y, w, h int32) win.HWND {
 	style := uint32(win.WS_CHILD | win.WS_VISIBLE | win.WS_TABSTOP | win.WS_BORDER | win.WS_VSCROLL |
 		win.ES_MULTILINE | win.ES_AUTOVSCROLL | win.ES_NOHIDESEL)
-	if horizontalScroll {
-		style |= win.WS_HSCROLL | win.ES_AUTOHSCROLL
-	}
 	hwnd := win.CreateWindowEx(0, syscall.StringToUTF16Ptr("EDIT"), nil,
 		style, x, y, w, h, a.hwnd, win.HMENU(uintptr(id)), a.instance, nil)
 	a.applyFont(hwnd)
@@ -2228,6 +2232,12 @@ func (a *app) applyFont(hwnd win.HWND) {
 	if font != 0 {
 		// The parent is hidden during control creation; paint everything once on ShowWindow.
 		win.SendMessage(hwnd, win.WM_SETFONT, uintptr(font), 0)
+	}
+}
+
+func (a *app) applyContentFont(hwnd win.HWND) {
+	if contentFont != 0 {
+		win.SendMessage(hwnd, win.WM_SETFONT, uintptr(contentFont), 0)
 	}
 }
 
@@ -2394,8 +2404,16 @@ func rgb(r, g, b byte) win.COLORREF {
 }
 
 func createUIFont() win.HFONT {
+	return createUIFontWithHeight(-16)
+}
+
+func createContentFont() win.HFONT {
+	return createUIFontWithHeight(-14)
+}
+
+func createUIFontWithHeight(height int32) win.HFONT {
 	var lf win.LOGFONT
-	lf.LfHeight = -16
+	lf.LfHeight = height
 	lf.LfWeight = win.FW_NORMAL
 	lf.LfCharSet = win.DEFAULT_CHARSET
 	lf.LfOutPrecision = win.OUT_DEFAULT_PRECIS
