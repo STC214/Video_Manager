@@ -60,6 +60,12 @@ func retryIOPaths(ctx context.Context, attempts int, paths []string, fn func() e
 	return err
 }
 
+// RetryIOPaths applies the same local and network-drive retry policy used by
+// the core mover. It is exported for sibling tools in this repository.
+func RetryIOPaths(ctx context.Context, attempts int, paths []string, fn func() error) error {
+	return retryIOPaths(ctx, attempts, paths, fn)
+}
+
 func hasNetworkPath(paths []string) bool {
 	for _, path := range paths {
 		if IsLikelyNetworkPath(path) {

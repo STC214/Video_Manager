@@ -34,6 +34,8 @@ type MoveSummary struct {
 	Error        string
 }
 
+var errTargetCapacityChanged = errors.New("target directory capacity changed after dry-run")
+
 func ExecuteMovePlan(ctx context.Context, plan MovePlan, opts MoveOptions, onProgress func(MoveProgress)) MoveSummary {
 	summary := MoveSummary{Total: len(plan.Items)}
 	if len(plan.Items) == 0 {
@@ -80,7 +82,17 @@ func ExecuteMovePlan(ctx context.Context, plan MovePlan, opts MoveOptions, onPro
 			break
 		}
 
-		status, moveErr := moveOne(ctx, item)
+		capacityErr := checkTargetCapacity(ctx, item.TargetPath, plan.TargetDirFileLimit, plan.ManagedExtensions)
+		if capacityErr != nil && ctx.Err() != nil {
+			summary.Cancelled = true
+			_ = writeManifest(writer, "cancelled", item)
+			break
+		}
+		status := ""
+		moveErr := capacityErr
+		if moveErr == nil {
+			status, moveErr = moveOne(ctx, item)
+		}
 		if moveErr != nil {
 			item.Status = "error"
 			item.Error = moveErr.Error()
@@ -109,6 +121,11 @@ func ExecuteMovePlan(ctx context.Context, plan MovePlan, opts MoveOptions, onPro
 				Error:      item.Error,
 			})
 		}
+		if capacityErr != nil {
+			summary.Error = capacityErr.Error()
+			summary.Failed += len(plan.Items) - i - 1
+			break
+		}
 	}
 	if err := writer.Flush(); err != nil && summary.Error == "" {
 		summary.Error = "manifest final flush failed: " + err.Error()
@@ -118,6 +135,53 @@ func ExecuteMovePlan(ctx context.Context, plan MovePlan, opts MoveOptions, onPro
 	}
 
 	return summary
+}
+
+func checkTargetCapacity(ctx context.Context, targetPath string, limit int, extensions []string) error {
+	if limit <= 0 || len(extensions) == 0 {
+		return nil
+	}
+	dir := filepath.Dir(targetPath)
+	var entries []os.DirEntry
+	err := retryIOPaths(ctx, 3, []string{dir}, func() error {
+		var readErr error
+		entries, readErr = os.ReadDir(fsPath(dir))
+		return readErr
+	})
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("%w: cannot verify %s: %v", errTargetCapacityChanged, dir, err)
+	}
+	normalized := make([]string, 0, len(extensions))
+	for _, value := range extensions {
+		ext := strings.ToLower(strings.TrimSpace(value))
+		if ext == "" {
+			continue
+		}
+		if !strings.HasPrefix(ext, ".") {
+			ext = "." + ext
+		}
+		normalized = append(normalized, ext)
+	}
+	count := 0
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		name := strings.ToLower(entry.Name())
+		for _, ext := range normalized {
+			if len(name) > len(ext) && strings.HasSuffix(name, ext) {
+				count++
+				break
+			}
+		}
+	}
+	if count >= limit {
+		return fmt.Errorf("%w: %s already contains %d matching files (limit %d)", errTargetCapacityChanged, dir, count, limit)
+	}
+	return nil
 }
 
 func moveOne(ctx context.Context, item MovePlanItem) (string, error) {

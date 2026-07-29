@@ -1,6 +1,10 @@
 # Build outputs and generated Windows resources
 /dist/
 /cmd/video-manager/*.syso
+/file-manager/cmd/file-manager/*.syso
+/file-manager/dist/
+/file-manager/.build/
+/file-manager/file-manager-data/
 /.build/
 /bin/
 *.exe

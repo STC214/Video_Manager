@@ -23,6 +23,12 @@ func fsPath(path string) string {
 	return path
 }
 
+// FSPath returns a Windows filesystem path with long-path support.
+// It is exported for sibling tools that share the archive I/O implementation.
+func FSPath(path string) string {
+	return fsPath(path)
+}
+
 func displayPath(path string) string {
 	path = filepath.Clean(strings.TrimSpace(path))
 	if strings.HasPrefix(path, `\\?\UNC\`) {
@@ -32,6 +38,11 @@ func displayPath(path string) string {
 		return strings.TrimPrefix(path, `\\?\`)
 	}
 	return path
+}
+
+// DisplayPath canonicalizes extended Windows paths for comparison and display.
+func DisplayPath(path string) string {
+	return displayPath(path)
 }
 
 func SamePath(left, right string) bool {

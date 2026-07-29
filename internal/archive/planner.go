@@ -99,16 +99,21 @@ type MovePlanItem struct {
 }
 
 type MovePlan struct {
-	Items              []MovePlanItem
-	TargetRoot         string
-	TargetDirCount     int
-	ConflictCount      int
-	ErrorCount         int
-	RequiredLeafDirs   int
-	AutoExpanded       bool
-	ConfiguredCapacity int
-	EffectiveCapacity  int
-	EffectiveFolders   []int
+	Items               []MovePlanItem
+	TargetRoot          string
+	TargetDirCount      int
+	ExistingTargetFiles int
+	LastLeafPath        string
+	LastLeafFileCount   int
+	TargetDirFileLimit  int
+	ManagedExtensions   []string
+	ConflictCount       int
+	ErrorCount          int
+	RequiredLeafDirs    int
+	AutoExpanded        bool
+	ConfiguredCapacity  int
+	EffectiveCapacity   int
+	EffectiveFolders    []int
 }
 
 func BuildMovePlan(files []VideoFile, cfg PlanConfig) MovePlan {
