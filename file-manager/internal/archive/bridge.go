@@ -15,18 +15,21 @@ type MoveSummary = core.MoveSummary
 type UndoSummary = core.UndoSummary
 
 var (
-	SamePath                 = core.SamePath
-	IsLikelyNetworkPath      = core.IsLikelyNetworkPath
-	CheckReadableDirContext  = core.CheckReadableDirContext
-	CheckTargetRootContext   = core.CheckTargetRootContext
-	ManifestHasUndoableItems = core.ManifestHasUndoableItems
-	PreviewEmptyDirs         = core.PreviewEmptyDirs
-	CleanupEmptyDirs         = core.CleanupEmptyDirs
-	ExecuteMovePlan          = core.ExecuteMovePlan
-	UndoManifest             = core.UndoManifest
-	FSPath                   = core.FSPath
-	DisplayPath              = core.DisplayPath
-	RetryIOPaths             = core.RetryIOPaths
+	SamePath                       = core.SamePath
+	IsLikelyNetworkPath            = core.IsLikelyNetworkPath
+	CheckReadableDirContext        = core.CheckReadableDirContext
+	CheckReadableDirForReadContext = core.CheckReadableDirForReadContext
+	CheckTargetRootContext         = core.CheckTargetRootContext
+	ManifestHasUndoableItems       = core.ManifestHasUndoableItems
+	PreviewEmptyDirs               = core.PreviewEmptyDirs
+	CleanupEmptyDirs               = core.CleanupEmptyDirs
+	ExecuteMovePlan                = core.ExecuteMovePlan
+	UndoManifest                   = core.UndoManifest
+	UndoManifestWithOptions        = core.UndoManifestWithOptions
+	FSPath                         = core.FSPath
+	DisplayPath                    = core.DisplayPath
+	RetryIOPaths                   = core.RetryIOPaths
+	RetryReadPaths                 = core.RetryReadPaths
 )
 
 func ExportMovePlanTSVContext(ctx context.Context, plan MovePlan, outputDir string) (string, error) {

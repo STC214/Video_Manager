@@ -31,8 +31,22 @@ func CheckReadableDir(path string) error {
 }
 
 func CheckReadableDirContext(ctx context.Context, path string) error {
+	return checkReadableDirContext(ctx, path, false)
+}
+
+// CheckReadableDirForReadContext retries transient missing-path responses on
+// network sources that were already selected by the user.
+func CheckReadableDirForReadContext(ctx context.Context, path string) error {
+	return checkReadableDirContext(ctx, path, true)
+}
+
+func checkReadableDirContext(ctx context.Context, path string, retryMissing bool) error {
+	retry := retryIOPaths
+	if retryMissing {
+		retry = RetryReadPaths
+	}
 	var info os.FileInfo
-	err := retryIOPaths(ctx, 3, []string{path}, func() error {
+	err := retry(ctx, 3, []string{path}, func() error {
 		var statErr error
 		info, statErr = os.Stat(fsPath(path))
 		return statErr
@@ -44,7 +58,7 @@ func CheckReadableDirContext(ctx context.Context, path string) error {
 		return fmt.Errorf("不是目录")
 	}
 	var entries []os.DirEntry
-	err = retryIOPaths(ctx, 3, []string{path}, func() error {
+	err = retry(ctx, 3, []string{path}, func() error {
 		var readErr error
 		entries, readErr = os.ReadDir(fsPath(path))
 		return readErr

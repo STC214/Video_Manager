@@ -11,8 +11,13 @@ func retryIO(ctx context.Context, attempts int, fn func() error) error {
 }
 
 func retryIOPaths(ctx context.Context, attempts int, paths []string, fn func() error) error {
+	return retryIOPathsWithMissing(ctx, attempts, paths, false, fn)
+}
+
+func retryIOPathsWithMissing(ctx context.Context, attempts int, paths []string, retryMissing bool, fn func() error) error {
 	delays := []time.Duration{150 * time.Millisecond, 300 * time.Millisecond, 450 * time.Millisecond}
-	if hasNetworkPath(paths) {
+	networkPath := hasNetworkPath(paths)
+	if networkPath {
 		if attempts < 8 {
 			attempts = 8
 		}
@@ -38,7 +43,7 @@ func retryIOPaths(ctx context.Context, attempts int, paths []string, fn func() e
 		if err == nil {
 			return nil
 		}
-		if os.IsNotExist(err) || os.IsExist(err) {
+		if (os.IsNotExist(err) && !(retryMissing && networkPath)) || os.IsExist(err) {
 			return err
 		}
 		if i+1 < attempts {
@@ -64,6 +69,12 @@ func retryIOPaths(ctx context.Context, attempts int, paths []string, fn func() e
 // the core mover. It is exported for sibling tools in this repository.
 func RetryIOPaths(ctx context.Context, attempts int, paths []string, fn func() error) error {
 	return retryIOPaths(ctx, attempts, paths, fn)
+}
+
+// RetryReadPaths retries transient missing-path responses for network reads.
+// Use it only for source paths that were already discovered or selected.
+func RetryReadPaths(ctx context.Context, attempts int, paths []string, fn func() error) error {
+	return retryIOPathsWithMissing(ctx, attempts, paths, true, fn)
 }
 
 func hasNetworkPath(paths []string) bool {

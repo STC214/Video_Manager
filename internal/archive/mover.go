@@ -13,7 +13,8 @@ import (
 )
 
 type MoveOptions struct {
-	ManifestDir string
+	ManifestDir     string
+	ReportItemStart bool
 }
 
 type MoveProgress struct {
@@ -80,6 +81,15 @@ func ExecuteMovePlan(ctx context.Context, plan MovePlan, opts MoveOptions, onPro
 			summary.Cancelled = true
 			writeManifest(writer, "cancelled", item)
 			break
+		}
+		if opts.ReportItemStart && onProgress != nil {
+			onProgress(MoveProgress{
+				Index:      i,
+				Total:      len(plan.Items),
+				SourcePath: item.SourcePath,
+				TargetPath: item.TargetPath,
+				Status:     "processing",
+			})
 		}
 
 		capacityErr := checkTargetCapacity(ctx, item.TargetPath, plan.TargetDirFileLimit, plan.ManagedExtensions)

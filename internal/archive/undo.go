@@ -26,6 +26,10 @@ func ManifestHasUndoableItems(path string) bool {
 }
 
 func UndoManifest(ctx context.Context, manifestPath string, onProgress func(MoveProgress)) UndoSummary {
+	return UndoManifestWithOptions(ctx, manifestPath, MoveOptions{}, onProgress)
+}
+
+func UndoManifestWithOptions(ctx context.Context, manifestPath string, opts MoveOptions, onProgress func(MoveProgress)) UndoSummary {
 	summary := UndoSummary{}
 	items, err := readManifestItems(manifestPath)
 	if err != nil {
@@ -39,6 +43,15 @@ func UndoManifest(ctx context.Context, manifestPath string, onProgress func(Move
 		if ctx.Err() != nil {
 			summary.Cancelled = true
 			break
+		}
+		if opts.ReportItemStart && onProgress != nil {
+			onProgress(MoveProgress{
+				Index:      summary.Restored + summary.Failed,
+				Total:      summary.Total,
+				SourcePath: items[i].TargetPath,
+				TargetPath: items[i].SourcePath,
+				Status:     "processing",
+			})
 		}
 		item := MovePlanItem{
 			SourcePath: items[i].TargetPath,

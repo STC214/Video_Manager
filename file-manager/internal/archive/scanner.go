@@ -86,7 +86,7 @@ func ScanFilesWithProgress(ctx context.Context, sourceDir string, excludedRoots,
 		reportProgress(onProgress, visited, result, dir)
 
 		var entries []os.DirEntry
-		err := RetryIOPaths(ctx, 3, []string{dir}, func() error {
+		err := RetryReadPaths(ctx, 3, []string{dir}, func() error {
 			var readErr error
 			entries, readErr = os.ReadDir(FSPath(dir))
 			return readErr
@@ -121,7 +121,7 @@ func ScanFilesWithProgress(ctx context.Context, sourceDir string, excludedRoots,
 				continue
 			}
 			var info os.FileInfo
-			statErr := RetryIOPaths(ctx, 3, []string{path}, func() error {
+			statErr := RetryReadPaths(ctx, 3, []string{path}, func() error {
 				var infoErr error
 				info, infoErr = entry.Info()
 				return infoErr
