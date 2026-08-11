@@ -24,31 +24,35 @@ const (
 	appTitle = "File Manager"
 	iconID   = 1
 
-	idSourceEdit   = 1001
-	idBrowse       = 1002
-	idScan         = 1003
-	idStartYear    = 1004
-	idExtensions   = 1005
-	idFilesLeaf    = 1006
-	idCalculate    = 1007
-	idResult       = 1008
-	idPreview      = 1009
-	idLog          = 1010
-	idTotalFiles   = 1011
-	idTargetEdit   = 1012
-	idBrowseTarget = 1013
-	idDryRun       = 1014
-	idMove         = 1015
-	idCancel       = 1016
-	idProgress     = 1017
-	idUndo         = 1018
-	idPreviewPrev  = 1019
-	idPreviewNext  = 1020
-	idFeedEdit     = 1021
-	idBrowseFeed   = 1022
-	idFeedDryRun   = 1023
+	idSourceEdit     = 1001
+	idBrowse         = 1002
+	idScan           = 1003
+	idStartYear      = 1004
+	idExtensions     = 1005
+	idFilesLeaf      = 1006
+	idCalculate      = 1007
+	idResult         = 1008
+	idPreview        = 1009
+	idLog            = 1010
+	idTotalFiles     = 1011
+	idTargetEdit     = 1012
+	idBrowseTarget   = 1013
+	idDryRun         = 1014
+	idMove           = 1015
+	idCancel         = 1016
+	idProgress       = 1017
+	idUndo           = 1018
+	idPreviewPrev    = 1019
+	idPreviewNext    = 1020
+	idFeedEdit       = 1021
+	idBrowseFeed     = 1022
+	idFeedDryRun     = 1023
+	idHierarchyDepth = 1024
+	idApplyHierarchy = 1025
 
-	idLeafDirsMonth = 1100
+	idLeafDirsMonth      = 1100
+	idHierarchyComboBase = 1200
+	idHierarchyEditBase  = 1220
 
 	wmScanComplete     = win.WM_APP + 1
 	wmMoveProgress     = win.WM_APP + 2
@@ -128,6 +132,7 @@ type app struct {
 	moveTotal                int
 	moveNetwork              bool
 	moveProgressBusy         bool
+	moveProgressPosted       bool
 	moveCleanupMessages      []string
 	moveCancel               context.CancelFunc
 	scanCancel               context.CancelFunc
@@ -171,6 +176,11 @@ type app struct {
 	configEdited             bool
 	closing                  bool
 	closeSaveStarted         bool
+	hierarchyDepth           int
+	hierarchyLabels          [maxHierarchyDepth]win.HWND
+	hierarchyCombos          [maxHierarchyDepth]win.HWND
+	hierarchyEdits           [maxHierarchyDepth]win.HWND
+	hierarchyExamples        [maxHierarchyDepth]win.HWND
 }
 
 func Run() {
@@ -247,7 +257,7 @@ func Run() {
 		win.CW_USEDEFAULT,
 		win.CW_USEDEFAULT,
 		1060,
-		780,
+		980,
 		0,
 		0,
 		a.instance,
@@ -347,7 +357,7 @@ func wndProc(hwnd win.HWND, msg uint32, wParam, lParam uintptr) uintptr {
 	case win.WM_GETMINMAXINFO:
 		mmi := (*win.MINMAXINFO)(unsafe.Pointer(lParam))
 		mmi.PtMinTrackSize.X = 1060
-		mmi.PtMinTrackSize.Y = 780
+		mmi.PtMinTrackSize.Y = 980
 		return 0
 	case wmScanComplete:
 		if a != nil {
@@ -438,7 +448,8 @@ func (a *app) createControls() {
 	a.button(idMove, "开始移动", 810, 127, 100, 30)
 	a.button(idUndo, "撤销最近", 920, 127, 105, 30)
 
-	a.label("按年份 / 季度 / 月份归档容量计算器", 24, 172, 300, 24)
+	a.label("可配置层级归档容量计算器", 24, 172, 300, 24)
+	a.label("先填写目录层数并应用，再为每一层选择常用名称或自定义名称", 330, 172, 610, 24)
 	a.label("目标文件总数", 24, 208, 110, 24)
 	a.controls[idTotalFiles] = a.edit(idTotalFiles, "0", 140, 204, 110, 28, true)
 	a.controls[idCalculate] = a.button(idCalculate, "重新计算", 900, 203, 125, 30)
@@ -452,21 +463,35 @@ func (a *app) createControls() {
 	a.label("每叶文件数", 775, 246, 100, 24)
 	a.controls[idFilesLeaf] = a.edit(idFilesLeaf, "30", 875, 242, 70, 28, true)
 
-	a.label("目录规则", 24, 288, 90, 24)
-	a.label("YYYY  →  YYYYS1..S4  →  YYYYMM  →  YYYYMMNN", 115, 288, 360, 24)
-	a.label("计算结果", 500, 288, 120, 24)
-	a.controls[idResult] = a.textArea(idResult, 500, 315, 525, 145)
+	a.label("目录层数", 24, 288, 75, 24)
+	a.controls[idHierarchyDepth] = a.edit(idHierarchyDepth, "4", 100, 282, 60, 28, true)
+	a.button(idApplyHierarchy, "应用层数", 170, 281, 105, 30)
+	a.label("可选 1～8 层；应用后会在下方生成每层设置", 290, 288, 430, 24)
+	for index := 0; index < maxHierarchyDepth; index++ {
+		y := int32(318 + index*32)
+		a.hierarchyLabels[index] = a.label(fmt.Sprintf("第 %d 层", index+1), 24, y+4, 52, 24)
+		a.hierarchyCombos[index] = a.combo(idHierarchyComboBase+index, 82, y, 178, 220)
+		for _, preset := range hierarchyPresets {
+			sendString(a.hierarchyCombos[index], win.CB_ADDSTRING, preset.name)
+		}
+		a.hierarchyEdits[index] = a.edit(idHierarchyEditBase+index, "", 270, y, 290, 28, false)
+		a.hierarchyExamples[index] = a.label("", 575, y+4, 450, 24)
+	}
+	a.setHierarchyRules(defaultHierarchyRules(4))
+
+	a.label("计算结果", 24, 580, 120, 24)
+	a.controls[idResult] = a.textArea(idResult, 24, 605, 1001, 115)
 	a.setReadOnly(a.controls[idResult])
 
-	a.label("预览", 24, 486, 90, 24)
-	a.button(idPreviewPrev, "上一页", 360, 480, 68, 28)
-	a.button(idPreviewNext, "下一页", 436, 480, 68, 28)
-	a.controls[idPreview] = a.textArea(idPreview, 24, 512, 490, 180)
+	a.label("预览", 24, 744, 90, 24)
+	a.button(idPreviewPrev, "上一页", 360, 738, 68, 28)
+	a.button(idPreviewNext, "下一页", 436, 738, 68, 28)
+	a.controls[idPreview] = a.textArea(idPreview, 24, 770, 490, 145)
 	a.applyContentFont(a.controls[idPreview])
 	a.setReadOnly(a.controls[idPreview])
 
-	a.label("日志", 526, 486, 90, 24)
-	a.controls[idLog] = a.textArea(idLog, 526, 512, 499, 180)
+	a.label("日志", 526, 744, 90, 24)
+	a.controls[idLog] = a.textArea(idLog, 526, 770, 499, 145)
 	a.applyContentFont(a.controls[idLog])
 	a.setReadOnly(a.controls[idLog])
 
@@ -486,9 +511,14 @@ func (a *app) setConfigurationEnabled(enabled bool) {
 	ids := []int{
 		idSourceEdit, idBrowse, idTargetEdit, idBrowseTarget, idFeedEdit, idBrowseFeed, idFeedDryRun,
 		idTotalFiles, idCalculate, idStartYear, idExtensions, idLeafDirsMonth, idFilesLeaf,
+		idHierarchyDepth, idApplyHierarchy,
 	}
 	for _, id := range ids {
 		win.EnableWindow(a.controls[id], enabled)
+	}
+	for index := 0; index < maxHierarchyDepth; index++ {
+		win.EnableWindow(a.hierarchyCombos[index], enabled)
+		win.EnableWindow(a.hierarchyEdits[index], enabled)
 	}
 }
 
@@ -555,7 +585,26 @@ func (a *app) handleCommand(wParam, lParam uintptr) {
 		if code == win.BN_CLICKED {
 			a.recalculate()
 		}
+	case idApplyHierarchy:
+		if code == win.BN_CLICKED {
+			depth := clamp(a.intFromControl(a.controls[idHierarchyDepth], 4), 1, maxHierarchyDepth)
+			a.initializing = true
+			a.setHierarchyRules(defaultHierarchyRules(depth))
+			a.initializing = false
+			a.configEdited = true
+			a.invalidatePlanForConfigurationChange()
+			a.recalculate()
+			a.log(fmt.Sprintf("已应用 %d 层目录，请按需要选择每层名称。", depth))
+		}
 	default:
+		if !a.initializing && isHierarchyComboID(id) && code == win.CBN_SELCHANGE {
+			a.prepareHierarchyInput(id - idHierarchyComboBase)
+			a.invalidatePlanForConfigurationChange()
+			a.recalculate()
+		}
+		if !a.initializing && isHierarchyEditID(id) && code == win.EN_CHANGE {
+			a.refreshHierarchyRow(id - idHierarchyEditBase)
+		}
 		if !a.initializing && lParam != 0 && code == win.EN_CHANGE && id == idFeedEdit {
 			a.invalidateFeedDependentState()
 		}
@@ -714,7 +763,7 @@ func (a *app) invalidateFeedDependentState() {
 }
 
 func isPlanConfigurationControl(id int) bool {
-	return id == idStartYear || id == idLeafDirsMonth || id == idFilesLeaf
+	return id == idStartYear || id == idLeafDirsMonth || id == idFilesLeaf || isHierarchyEditID(id)
 }
 
 func (a *app) invalidatePlanForConfigurationChange() {
@@ -739,6 +788,7 @@ func samePlanConfig(left, right archive.PlanConfig) bool {
 		left.StartYear != right.StartYear ||
 		left.LeafDirsPerMonth != right.LeafDirsPerMonth ||
 		left.FilesPerLeaf != right.FilesPerLeaf ||
+		strings.TrimSpace(left.PathTemplate) != strings.TrimSpace(right.PathTemplate) ||
 		len(left.Extensions) != len(right.Extensions) {
 		return false
 	}
@@ -751,15 +801,22 @@ func samePlanConfig(left, right archive.PlanConfig) bool {
 }
 
 func isConfigurationCommand(id, code int) bool {
+	if code == win.CBN_SELCHANGE && isHierarchyComboID(id) {
+		return true
+	}
+	if code == win.BN_CLICKED && id == idApplyHierarchy {
+		return true
+	}
 	if code != win.EN_CHANGE {
 		return false
 	}
 	return id == idSourceEdit || id == idFeedEdit || id == idTargetEdit || id == idExtensions ||
-		id == idTotalFiles || id == idStartYear || id == idLeafDirsMonth || id == idFilesLeaf
+		id == idTotalFiles || id == idStartYear || id == idLeafDirsMonth || id == idFilesLeaf ||
+		id == idHierarchyDepth || isHierarchyEditID(id)
 }
 
 func (a *app) isCalculatorInput(id int) bool {
-	return id == idStartYear || id == idLeafDirsMonth || id == idFilesLeaf || id == idTotalFiles
+	return id == idStartYear || id == idLeafDirsMonth || id == idFilesLeaf || id == idTotalFiles || isHierarchyEditID(id)
 }
 
 func (a *app) startScan() {
@@ -1542,16 +1599,20 @@ func (a *app) startMove() {
 			a.moveDone = 0
 			a.moveTotal = len(plan.Items)
 			a.mu.Unlock()
-			win.PostMessage(a.hwnd, wmMoveProgress, 0, 0)
+			a.postMoveProgress()
 		}
 		lastPost := time.Now().Add(-time.Second)
 		summary := archive.ExecuteMovePlan(ctx, plan, archive.MoveOptions{ReportItemStart: networkMove}, func(progress archive.MoveProgress) {
-			if progress.Status != "processing" && time.Since(lastPost) < 250*time.Millisecond && progress.Index != progress.Total {
+			now := time.Now()
+			if !shouldPublishMoveProgress(now, lastPost, progress.Index, progress.Total) {
 				return
 			}
-			lastPost = time.Now()
+			lastPost = now
 			a.mu.Lock()
-			a.moveProgressBusy = a.moveNetwork && progress.Status == "processing"
+			// Item moves use determinate progress. Marquee mode is reserved for
+			// network phases whose duration cannot be measured, so the native
+			// progress control is not restyled for every item transition.
+			a.moveProgressBusy = false
 			if progress.Status == "processing" {
 				a.moveStatus = fmt.Sprintf("正在处理网络文件 %d/%d: %s", progress.Index+1, progress.Total, progress.TargetPath)
 			} else if progress.Error != "" {
@@ -1562,7 +1623,7 @@ func (a *app) startMove() {
 			a.moveDone = progress.Index
 			a.moveTotal = progress.Total
 			a.mu.Unlock()
-			win.PostMessage(a.hwnd, wmMoveProgress, 0, 0)
+			a.postMoveProgress()
 		})
 		if !summary.Cancelled && summary.Error == "" && summary.Moved > 0 && sourceRoot != "" {
 			if archive.IsLikelyNetworkPath(sourceRoot) {
@@ -1570,7 +1631,7 @@ func (a *app) startMove() {
 				a.moveProgressBusy = true
 				a.moveStatus = "正在读取网络源目录并清理空目录……"
 				a.mu.Unlock()
-				win.PostMessage(a.hwnd, wmMoveProgress, 0, 0)
+				a.postMoveProgress()
 			}
 			removed, errs := archive.CleanupEmptyDirs(ctx, sourceRoot, []string{targetRoot})
 			if len(errs) > 0 {
@@ -1589,7 +1650,7 @@ func (a *app) startMove() {
 				a.moveProgressBusy = true
 				a.moveStatus = "正在读取网络目标目录并清理投料临时目录……"
 				a.mu.Unlock()
-				win.PostMessage(a.hwnd, wmMoveProgress, 0, 0)
+				a.postMoveProgress()
 			}
 			removed, errs := archive.CleanupFeedStaging(ctx, plan.StagingRoot)
 			if len(errs) > 0 {
@@ -1736,14 +1797,40 @@ func (a *app) showMoveProgress() {
 	done := a.moveDone
 	total := a.moveTotal
 	busy := a.moveProgressBusy
+	a.moveProgressPosted = false
 	a.mu.Unlock()
 	if status != "" {
-		a.log(status)
+		a.logMoveProgress(status)
 	}
 	if busy {
 		a.setProgressBusy(true)
 	} else if total > 0 {
 		a.setProgress(done, total)
+	}
+}
+
+const moveProgressInterval = 250 * time.Millisecond
+
+func shouldPublishMoveProgress(now, last time.Time, index, total int) bool {
+	return index == total || now.Sub(last) >= moveProgressInterval
+}
+
+// postMoveProgress coalesces worker notifications. The UI always reads the
+// newest move state, so queuing more than one notification only causes repeated
+// native control redraws without preserving additional information.
+func (a *app) postMoveProgress() {
+	a.mu.Lock()
+	if a.moveProgressPosted {
+		a.mu.Unlock()
+		return
+	}
+	a.moveProgressPosted = true
+	hwnd := a.hwnd
+	a.mu.Unlock()
+	if win.PostMessage(hwnd, wmMoveProgress, 0, 0) == 0 {
+		a.mu.Lock()
+		a.moveProgressPosted = false
+		a.mu.Unlock()
 	}
 }
 
@@ -1768,6 +1855,7 @@ func (a *app) finishMove() {
 	a.setConfigurationEnabled(true)
 	a.setActionState(true, false, false, false, hasManifest)
 	a.setProgress(summary.Moved+summary.Failed, summary.Total)
+	a.recalculate()
 	a.log(fmt.Sprintf("移动完成: 总数 %d, 成功 %d, 失败 %d, 已取消 %s", summary.Total, summary.Moved, summary.Failed, yesNo(summary.Cancelled)))
 	if summary.Error != "" {
 		a.log("移动安全检查错误: " + summary.Error)
@@ -1836,12 +1924,13 @@ func (a *app) startUndo() {
 	go func() {
 		lastPost := time.Now().Add(-time.Second)
 		summary := archive.UndoManifestWithOptions(ctx, manifest, archive.MoveOptions{ReportItemStart: networkUndo}, func(progress archive.MoveProgress) {
-			if progress.Status != "processing" && time.Since(lastPost) < 250*time.Millisecond && progress.Index != progress.Total {
+			now := time.Now()
+			if !shouldPublishMoveProgress(now, lastPost, progress.Index, progress.Total) {
 				return
 			}
-			lastPost = time.Now()
+			lastPost = now
 			a.mu.Lock()
-			a.moveProgressBusy = a.moveNetwork && progress.Status == "processing"
+			a.moveProgressBusy = false
 			if progress.Status == "processing" {
 				a.moveStatus = fmt.Sprintf("正在处理网络撤销 %d/%d: %s", progress.Index+1, progress.Total, progress.TargetPath)
 			} else if progress.Error != "" {
@@ -1852,7 +1941,7 @@ func (a *app) startUndo() {
 			a.moveDone = progress.Index
 			a.moveTotal = progress.Total
 			a.mu.Unlock()
-			win.PostMessage(a.hwnd, wmMoveProgress, 0, 0)
+			a.postMoveProgress()
 		})
 		a.mu.Lock()
 		a.moveStatus = fmt.Sprintf("撤销完成: 总数 %d, 成功 %d, 失败 %d, 已取消 %s", summary.Total, summary.Restored, summary.Failed, yesNo(summary.Cancelled))
@@ -1876,12 +1965,15 @@ func (a *app) finishUndo() {
 		a.lastManifestAvailable = false
 	}
 	hasPendingUndo := a.lastManifestAvailable
+	status := a.moveStatus
 	a.moveNetwork = false
 	a.moveProgressBusy = false
 	a.mu.Unlock()
 	a.setConfigurationEnabled(true)
 	a.setActionState(true, false, false, false, hasPendingUndo)
 	a.showMoveProgress()
+	a.recalculate()
+	a.appendLogControl(status)
 	if !hasPendingUndo {
 		a.saveConfigAsync()
 	}
@@ -1889,9 +1981,14 @@ func (a *app) finishUndo() {
 
 func (a *app) recalculate() {
 	cfg := a.planConfig(a.currentTotalFiles())
+	if err := archive.ValidatePathTemplate(cfg.PathTemplate); err != nil {
+		a.setText(a.controls[idResult], "目录模板错误: "+err.Error())
+		return
+	}
 	result := archive.CalculateCapacity(a.currentTotalFiles(), cfg)
 	resultText := fmt.Sprintf(
-		"目标文件总数: %d\r\n需要叶目录: %d\r\n涉及月份 / 季度 / 年份: %d / %d / %d\r\n最后叶目录: %s\r\n最后叶目录文件数: %d\r\n每月容量: %d\r\n每年容量: %d",
+		"目录层数: %d\r\n目标文件总数: %d\r\n需要叶目录: %d\r\n涉及月份 / 季度 / 年份: %d / %d / %d\r\n最后叶目录: %s\r\n最后叶目录文件数: %d\r\n每月容量: %d\r\n每年容量: %d",
+		archive.PathTemplateDepth(cfg.PathTemplate),
 		result.TotalFiles,
 		result.RequiredLeafDirs,
 		result.RequiredMonths,
@@ -2008,6 +2105,7 @@ func (a *app) applyConfig(cfg appconfig.Config, manifestAvailable bool) {
 	if cfg.FilesPerLeaf > 0 {
 		a.setText(a.controls[idFilesLeaf], strconv.Itoa(cfg.FilesPerLeaf))
 	}
+	a.setHierarchyRules(hierarchyRulesFromTemplate(cfg.PathTemplate))
 	a.lastManifest = cfg.LastManifest
 	a.lastManifestAvailable = manifestAvailable
 	win.EnableWindow(a.controls[idUndo], a.lastManifestAvailable)
@@ -2022,6 +2120,7 @@ func (a *app) configSnapshot() appconfig.Config {
 		StartYear:        clamp(a.intFromControl(a.controls[idStartYear], time.Now().Year()), 1000, 9999),
 		LeafDirsPerMonth: clamp(a.intFromControl(a.controls[idLeafDirsMonth], 4), 1, 99),
 		FilesPerLeaf:     clamp(a.intFromControl(a.controls[idFilesLeaf], 30), 1, 1000000),
+		PathTemplate:     a.currentPathTemplate(),
 		LastManifest:     a.lastManifest,
 	}
 }
@@ -2086,6 +2185,7 @@ func (a *app) planConfig(totalFiles int) archive.PlanConfig {
 		StartYear:        clamp(a.intFromControl(a.controls[idStartYear], time.Now().Year()), 1000, 9999),
 		LeafDirsPerMonth: clamp(a.intFromControl(a.controls[idLeafDirsMonth], 4), 1, 99),
 		FilesPerLeaf:     clamp(a.intFromControl(a.controls[idFilesLeaf], 30), 1, 1000000),
+		PathTemplate:     a.currentPathTemplate(),
 		Extensions:       extensions,
 	}
 }
@@ -2271,6 +2371,30 @@ func (a *app) intFromControl(hwnd win.HWND, fallback int) int {
 }
 
 func (a *app) log(message string) {
+	a.enqueueLog(message)
+	a.appendLogControl(message)
+}
+
+func (a *app) appendLogControl(message string) {
+	hwnd := a.controls[idLog]
+	if hwnd == 0 {
+		return
+	}
+	const maxLogLines = 200
+	a.setTextNoFlicker(hwnd, prependLogMessage(a.text(hwnd), message, maxLogLines))
+}
+
+// logMoveProgress persists sampled progress while displaying it in the result
+// pane. It deliberately avoids rebuilding the multi-line log control for every
+// progress sample; finishMove and finishUndo restore the calculated result.
+func (a *app) logMoveProgress(message string) {
+	a.enqueueLog(message)
+	if hwnd := a.controls[idResult]; hwnd != 0 {
+		a.setTextNoFlicker(hwnd, message)
+	}
+}
+
+func (a *app) enqueueLog(message string) {
 	if a.logCh != nil {
 		a.logOnce.Do(func() {
 			go a.runLogWriter()
@@ -2280,12 +2404,6 @@ func (a *app) log(message string) {
 		default:
 		}
 	}
-	hwnd := a.controls[idLog]
-	if hwnd == 0 {
-		return
-	}
-	const maxLogLines = 200
-	a.setTextNoFlicker(hwnd, prependLogMessage(a.text(hwnd), message, maxLogLines))
 }
 
 func prependLogMessage(old, message string, limit int) string {

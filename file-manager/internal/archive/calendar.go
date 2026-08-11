@@ -2,7 +2,6 @@ package archive
 
 import (
 	"fmt"
-	"path/filepath"
 	"strings"
 )
 
@@ -11,6 +10,7 @@ type PlanConfig struct {
 	StartYear        int
 	LeafDirsPerMonth int
 	FilesPerLeaf     int
+	PathTemplate     string
 	Extensions       []string
 }
 
@@ -40,6 +40,11 @@ func NormalizePlanConfig(cfg PlanConfig) PlanConfig {
 	if cfg.FilesPerLeaf <= 0 {
 		cfg.FilesPerLeaf = 30
 	}
+	if strings.TrimSpace(cfg.PathTemplate) == "" {
+		cfg.PathTemplate = DefaultPathTemplate
+	} else {
+		cfg.PathTemplate = strings.TrimSpace(cfg.PathTemplate)
+	}
 	return cfg
 }
 
@@ -64,13 +69,13 @@ func CalculateCapacity(totalFiles int, cfg PlanConfig) CapacityResult {
 	if result.LastLeafFileCount == 0 {
 		result.LastLeafFileCount = cfg.FilesPerLeaf
 	}
-	result.LastLeafPath = CalendarLeafPath(cfg.StartYear, result.RequiredLeafDirs, cfg.LeafDirsPerMonth)
+	result.LastLeafPath = CalendarLeafPathForConfig(cfg, result.RequiredLeafDirs)
 	limit := result.RequiredLeafDirs
 	if limit > 5 {
 		limit = 5
 	}
 	for i := 1; i <= limit; i++ {
-		result.PreviewPaths = append(result.PreviewPaths, CalendarLeafPath(cfg.StartYear, i, cfg.LeafDirsPerMonth))
+		result.PreviewPaths = append(result.PreviewPaths, CalendarLeafPathForConfig(cfg, i))
 	}
 	if result.RequiredLeafDirs > limit {
 		result.PreviewPaths = append(result.PreviewPaths, "...", result.LastLeafPath)
@@ -79,23 +84,7 @@ func CalculateCapacity(totalFiles int, cfg PlanConfig) CapacityResult {
 }
 
 func CalendarLeafPath(startYear, leafIndex, leafDirsPerMonth int) string {
-	if leafIndex < 1 {
-		return ""
-	}
-	if leafDirsPerMonth < 1 {
-		leafDirsPerMonth = 1
-	}
-	zero := leafIndex - 1
-	monthOffset := zero / leafDirsPerMonth
-	leafInMonth := zero%leafDirsPerMonth + 1
-	year := startYear + monthOffset/12
-	month := monthOffset%12 + 1
-	quarter := (month-1)/3 + 1
-	yearName := fmt.Sprintf("%04d", year)
-	quarterName := fmt.Sprintf("%04dS%d", year, quarter)
-	monthName := fmt.Sprintf("%04d%02d", year, month)
-	leafName := fmt.Sprintf("%04d%02d%02d", year, month, leafInMonth)
-	return filepath.Join(yearName, quarterName, monthName, leafName)
+	return CalendarLeafPathForConfig(PlanConfig{StartYear: startYear, LeafDirsPerMonth: leafDirsPerMonth}, leafIndex)
 }
 
 func ValidateConfig(cfg PlanConfig) error {
@@ -111,6 +100,9 @@ func ValidateConfig(cfg PlanConfig) error {
 	}
 	if cfg.FilesPerLeaf < 1 || cfg.FilesPerLeaf > 1000000 {
 		return fmt.Errorf("每个叶目录文件数必须在 1 到 1000000 之间")
+	}
+	if err := ValidatePathTemplate(cfg.PathTemplate); err != nil {
+		return err
 	}
 	return nil
 }

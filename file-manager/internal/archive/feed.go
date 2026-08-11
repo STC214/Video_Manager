@@ -7,7 +7,6 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
-	"strconv"
 	"strings"
 	"time"
 )
@@ -29,6 +28,13 @@ func AuditTargetContext(ctx context.Context, cfg PlanConfig) TargetAudit {
 	}
 	cfg = NormalizePlanConfig(cfg)
 	audit := TargetAudit{Correct: true, Message: "目标目录为空，可直接投料。"}
+	if err := ValidatePathTemplate(cfg.PathTemplate); err != nil {
+		audit.Correct = false
+		audit.ErrorCount = 1
+		audit.Errors = []string{err.Error()}
+		audit.Message = "目录模板无效。"
+		return audit
+	}
 	if strings.TrimSpace(cfg.TargetDir) == "" {
 		audit.Correct = false
 		audit.ErrorCount = 1
@@ -138,7 +144,7 @@ func AuditTargetContext(ctx context.Context, cfg PlanConfig) TargetAudit {
 		index, ok := calendarLeafIndex(targetRoot, file.SourcePath, cfg)
 		if !ok {
 			audit.Correct = false
-			audit.Message = "发现对应后缀文件不在规范的年份/季度/月/叶目录中，需要先重排。"
+			audit.Message = "发现对应后缀文件不在当前目录模板规定的层级中，需要先重排。"
 			return audit
 		}
 		counts[index]++
@@ -365,7 +371,7 @@ func buildRebalanceFeedPlan(ctx context.Context, audit TargetAudit, feedFiles []
 	targetDirs := map[string]struct{}{}
 	addFinal := func(source string, file VideoFile, globalIndex int) {
 		leafIndex := globalIndex/cfg.FilesPerLeaf + 1
-		targetDir := filepath.Join(targetRoot, CalendarLeafPath(cfg.StartYear, leafIndex, cfg.LeafDirsPerMonth))
+		targetDir := filepath.Join(targetRoot, CalendarLeafPathForConfig(cfg, leafIndex))
 		targetDirs[targetDir] = struct{}{}
 		managedExt, _ := matchingExtension(file.Name, cfg.Extensions)
 		targetPath, conflict, err := resolver.uniquePath(filepath.Join(targetDir, file.Name), managedExt)
@@ -411,7 +417,7 @@ func buildRebalanceFeedPlan(ctx context.Context, audit TargetAudit, feedFiles []
 	totalFinal := len(existing) + len(feed)
 	if totalFinal > 0 {
 		plan.RequiredLeafDirs = ceilDiv(totalFinal, cfg.FilesPerLeaf)
-		plan.LastLeafPath = CalendarLeafPath(cfg.StartYear, plan.RequiredLeafDirs, cfg.LeafDirsPerMonth)
+		plan.LastLeafPath = CalendarLeafPathForConfig(cfg, plan.RequiredLeafDirs)
 		plan.LastLeafFileCount = totalFinal % cfg.FilesPerLeaf
 		if plan.LastLeafFileCount == 0 {
 			plan.LastLeafFileCount = cfg.FilesPerLeaf
@@ -426,33 +432,5 @@ func calendarLeafIndex(targetRoot, filePath string, cfg PlanConfig) (int, bool) 
 	if err != nil {
 		return 0, false
 	}
-	parts := strings.Split(filepath.Clean(rel), string(filepath.Separator))
-	if len(parts) != 4 {
-		return 0, false
-	}
-	if len(parts[0]) != 4 {
-		return 0, false
-	}
-	year, err := strconv.Atoi(parts[0])
-	if err != nil || year < cfg.StartYear || year > 9999 {
-		return 0, false
-	}
-	if len(parts[2]) != 6 || len(parts[3]) != 8 {
-		return 0, false
-	}
-	month, err := strconv.Atoi(parts[2][4:6])
-	if err != nil || month < 1 || month > 12 || parts[2][:4] != parts[0] {
-		return 0, false
-	}
-	leafNo, err := strconv.Atoi(parts[3][6:8])
-	if err != nil || leafNo < 1 || leafNo > cfg.LeafDirsPerMonth {
-		return 0, false
-	}
-	quarter := (month-1)/3 + 1
-	if parts[1] != fmt.Sprintf("%04dS%d", year, quarter) ||
-		parts[3] != fmt.Sprintf("%04d%02d%02d", year, month, leafNo) {
-		return 0, false
-	}
-	monthOffset := (year-cfg.StartYear)*12 + month - 1
-	return monthOffset*cfg.LeafDirsPerMonth + leafNo, true
+	return CalendarLeafIndex(rel, cfg)
 }

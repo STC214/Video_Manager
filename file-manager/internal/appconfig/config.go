@@ -15,6 +15,7 @@ type Config struct {
 	StartYear        int    `json:"startYear"`
 	LeafDirsPerMonth int    `json:"leafDirsPerMonth"`
 	FilesPerLeaf     int    `json:"filesPerLeaf"`
+	PathTemplate     string `json:"pathTemplate,omitempty"`
 	LastManifest     string `json:"lastManifest"`
 }
 

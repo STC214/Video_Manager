@@ -39,7 +39,7 @@ func BuildMovePlanContext(ctx context.Context, files []VideoFile, cfg PlanConfig
 	result.RequiredLeafDirs = capacity.RequiredLeafDirs
 	result.ConfiguredCapacity = capacity.FilesPerYear
 	result.EffectiveCapacity = saturatedMultiply(capacity.RequiredYears, capacity.FilesPerYear)
-	result.EffectiveFolders = []int{capacity.RequiredYears, 4, 3, cfg.LeafDirsPerMonth}
+	result.EffectiveFolders = EffectiveFolderCounts(cfg, capacity.RequiredYears)
 	result.TargetDirFileLimit = cfg.FilesPerLeaf
 	result.ManagedExtensions = append([]string(nil), cfg.Extensions...)
 	targetRoot := filepath.Clean(strings.TrimSpace(cfg.TargetDir))
@@ -67,7 +67,7 @@ func BuildMovePlanContext(ctx context.Context, files []VideoFile, cfg PlanConfig
 				break
 			}
 			if filesInLeaf < 0 {
-				targetDir := filepath.Join(targetRoot, CalendarLeafPath(cfg.StartYear, leafIndex, cfg.LeafDirsPerMonth))
+				targetDir := filepath.Join(targetRoot, CalendarLeafPathForConfig(cfg, leafIndex))
 				filesInLeaf, capacityErr = resolver.matchingFileCount(targetDir, cfg.Extensions)
 				if capacityErr != nil {
 					break
@@ -91,7 +91,7 @@ func BuildMovePlanContext(ctx context.Context, files []VideoFile, cfg PlanConfig
 			})
 			continue
 		}
-		targetDir := filepath.Join(targetRoot, CalendarLeafPath(cfg.StartYear, leafIndex, cfg.LeafDirsPerMonth))
+		targetDir := filepath.Join(targetRoot, CalendarLeafPathForConfig(cfg, leafIndex))
 		targetDirs[targetDir] = struct{}{}
 		managedExt, _ := matchingExtension(file.Name, cfg.Extensions)
 		targetPath, conflict, err := resolver.uniquePath(filepath.Join(targetDir, file.Name), managedExt)
@@ -105,14 +105,14 @@ func BuildMovePlanContext(ctx context.Context, files []VideoFile, cfg PlanConfig
 		}
 		result.Items = append(result.Items, MovePlanItem{SourcePath: file.SourcePath, TargetPath: targetPath, Size: file.Size, ModTime: file.ModTime, Conflict: conflict, Status: "planned"})
 		filesInLeaf++
-		result.LastLeafPath = CalendarLeafPath(cfg.StartYear, leafIndex, cfg.LeafDirsPerMonth)
+		result.LastLeafPath = CalendarLeafPathForConfig(cfg, leafIndex)
 		result.LastLeafFileCount = filesInLeaf
 	}
 	result.RequiredLeafDirs = leafIndex
 	requiredMonths := ceilDiv(leafIndex, cfg.LeafDirsPerMonth)
 	requiredYears := ceilDiv(requiredMonths, 12)
 	result.EffectiveCapacity = saturatedMultiply(requiredYears, capacity.FilesPerYear)
-	result.EffectiveFolders = []int{requiredYears, 4, 3, cfg.LeafDirsPerMonth}
+	result.EffectiveFolders = EffectiveFolderCounts(cfg, requiredYears)
 	result.TargetDirCount = len(targetDirs)
 	return result
 }
