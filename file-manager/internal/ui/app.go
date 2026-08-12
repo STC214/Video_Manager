@@ -181,6 +181,8 @@ type app struct {
 	hierarchyCombos          [maxHierarchyDepth]win.HWND
 	hierarchyEdits           [maxHierarchyDepth]win.HWND
 	hierarchyExamples        [maxHierarchyDepth]win.HWND
+	periodCountLabel         win.HWND
+	filesPerLeafLabel        win.HWND
 }
 
 func Run() {
@@ -458,9 +460,9 @@ func (a *app) createControls() {
 	a.controls[idExtensions] = a.edit(idExtensions, ".jpg,.png", 100, 242, 260, 28, false)
 	a.label("起始年份", 385, 246, 80, 24)
 	a.controls[idStartYear] = a.edit(idStartYear, strconv.Itoa(time.Now().Year()), 465, 242, 75, 28, true)
-	a.label("每月叶目录数", 565, 246, 110, 24)
+	a.periodCountLabel = a.label("每月份分组数", 565, 246, 110, 24)
 	a.controls[idLeafDirsMonth] = a.edit(idLeafDirsMonth, "4", 680, 242, 70, 28, true)
-	a.label("每叶文件数", 775, 246, 100, 24)
+	a.filesPerLeafLabel = a.label("每目录文件数", 775, 246, 100, 24)
 	a.controls[idFilesLeaf] = a.edit(idFilesLeaf, "30", 875, 242, 70, 28, true)
 
 	a.label("目录层数", 24, 288, 75, 24)
@@ -599,6 +601,7 @@ func (a *app) handleCommand(wParam, lParam uintptr) {
 	default:
 		if !a.initializing && isHierarchyComboID(id) && code == win.CBN_SELCHANGE {
 			a.prepareHierarchyInput(id - idHierarchyComboBase)
+			a.refreshPeriodControls()
 			a.invalidatePlanForConfigurationChange()
 			a.recalculate()
 		}
@@ -1047,7 +1050,7 @@ func (a *app) generateDryRun() {
 			fmt.Sprintf("Dry-run: %d 个文件, 目标目录 %d 个, 重名冲突 %d 个, 错误 %d 个",
 				len(plan.Items), plan.TargetDirCount, plan.ConflictCount, plan.ErrorCount),
 			"排序规则: 文件最后修改时间从早到晚，越早的文件进入编号越小的叶目录。",
-			fmt.Sprintf("目录规则: 从 %04d 年开始，每月 %d 个叶目录，每叶最多 %d 个文件。", cfg.StartYear, cfg.LeafDirsPerMonth, cfg.FilesPerLeaf),
+			archiveRuleSummary(cfg),
 			fmt.Sprintf("续排结果: 涉及叶目录原有匹配文件 %d 个，最后叶目录 %s，规划后含 %d 个匹配文件。",
 				plan.ExistingTargetFiles, emptyDash(plan.LastLeafPath), plan.LastLeafFileCount),
 			"",
@@ -1243,7 +1246,7 @@ func (a *app) generateFeedDryRun() {
 			"目标审计: " + auditState,
 			"审计说明: " + plan.AuditMessage,
 			"排序规则: 需要重排时，现有目标文件按修改时间从老到新重排；投料文件随后按修改时间从老到新追加。",
-			fmt.Sprintf("目录规则: 从 %04d 年开始，每月 %d 个叶目录，每叶最多 %d 个文件。", cfg.StartYear, cfg.LeafDirsPerMonth, cfg.FilesPerLeaf),
+			archiveRuleSummary(cfg),
 			fmt.Sprintf("规划后最后叶目录: %s，其中匹配文件 %d 个。", emptyDash(plan.LastLeafPath), plan.LastLeafFileCount),
 			"",
 		}
@@ -1986,17 +1989,20 @@ func (a *app) recalculate() {
 		return
 	}
 	result := archive.CalculateCapacity(a.currentTotalFiles(), cfg)
+	periodCount := result.RequiredPeriods
 	resultText := fmt.Sprintf(
-		"目录层数: %d\r\n目标文件总数: %d\r\n需要叶目录: %d\r\n涉及月份 / 季度 / 年份: %d / %d / %d\r\n最后叶目录: %s\r\n最后叶目录文件数: %d\r\n每月容量: %d\r\n每年容量: %d",
+		"目录层数: %d\r\n目标文件总数: %d\r\n最终容器: %s目录\r\n需要最终目录: %d\r\n涉及%s / 年份: %d / %d\r\n最后目录: %s\r\n最后目录文件数: %d\r\n每%s容量: %d\r\n每年容量: %d",
 		archive.PathTemplateDepth(cfg.PathTemplate),
 		result.TotalFiles,
+		result.PeriodName,
 		result.RequiredLeafDirs,
-		result.RequiredMonths,
-		result.RequiredQuarters,
+		result.PeriodName,
+		periodCount,
 		result.RequiredYears,
 		emptyDash(result.LastLeafPath),
 		result.LastLeafFileCount,
-		result.FilesPerMonth,
+		result.PeriodName,
+		result.FilesPerPeriod,
 		result.FilesPerYear,
 	)
 	a.setText(a.controls[idResult], resultText)
@@ -2176,6 +2182,17 @@ func (a *app) finishConfigSaveFailed() {
 
 func (a *app) currentTotalFiles() int {
 	return clamp(a.intFromControl(a.controls[idTotalFiles], 0), 0, 1000000000)
+}
+
+func archiveRuleSummary(cfg archive.PlanConfig) string {
+	layout, err := archive.AnalyzePathTemplate(cfg.PathTemplate)
+	if err != nil {
+		return "目录规则: " + err.Error()
+	}
+	if layout.HasSequence {
+		return fmt.Sprintf("目录规则: 从 %04d 年开始，每%s %d 个分组目录，每个目录最多 %d 个文件。", cfg.StartYear, periodUnitName(layout.PeriodName), archive.EffectiveLeafDirsPerPeriod(cfg), cfg.FilesPerLeaf)
+	}
+	return fmt.Sprintf("目录规则: 从 %04d 年开始，以%s目录作为最终容器，每个目录最多 %d 个文件。", cfg.StartYear, layout.PeriodName, cfg.FilesPerLeaf)
 }
 
 func (a *app) planConfig(totalFiles int) archive.PlanConfig {

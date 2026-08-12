@@ -47,9 +47,9 @@ func defaultHierarchyRules(depth int) []hierarchyRule {
 	depth = clamp(depth, 1, maxHierarchyDepth)
 	switch depth {
 	case 1:
-		return []hierarchyRule{{preset: presetCustom, value: "{YYYY}{MM}{NN}"}}
+		return []hierarchyRule{{preset: presetYear}}
 	case 2:
-		return []hierarchyRule{{preset: presetYear}, {preset: presetCustom, value: "{YYYY}{MM}{NN}"}}
+		return []hierarchyRule{{preset: presetYear}, {preset: presetQuarter}}
 	case 3:
 		return []hierarchyRule{{preset: presetYear}, {preset: presetMonth}, {preset: presetLeaf}}
 	case 4:
@@ -162,6 +162,7 @@ func (a *app) setHierarchyRules(rules []hierarchyRule) {
 		a.setText(a.hierarchyEdits[index], rule.value)
 		a.refreshHierarchyRow(index)
 	}
+	a.refreshPeriodControls()
 }
 
 func (a *app) hierarchyRuleAt(index int) hierarchyRule {
@@ -214,6 +215,41 @@ func (a *app) refreshHierarchyRow(index int) {
 	}
 	showWindow(a.hierarchyEdits[index], hierarchyPresets[rule.preset].needsInput)
 	a.setTextNoFlicker(a.hierarchyExamples[index], hierarchyRuleExample(rule))
+	if !a.initializing {
+		a.refreshPeriodControls()
+	}
+}
+
+func (a *app) refreshPeriodControls() {
+	template, err := hierarchyTemplateFromRules(a.currentHierarchyRules())
+	if err != nil {
+		showWindow(a.controls[idLeafDirsMonth], true)
+		win.EnableWindow(a.controls[idLeafDirsMonth], true)
+		a.setTextNoFlicker(a.periodCountLabel, "周期内分组数")
+		return
+	}
+	layout, err := archive.AnalyzePathTemplate(template)
+	if err != nil {
+		return
+	}
+	showWindow(a.controls[idLeafDirsMonth], layout.HasSequence)
+	showWindow(a.periodCountLabel, layout.HasSequence)
+	win.EnableWindow(a.controls[idLeafDirsMonth], layout.HasSequence)
+	if layout.HasSequence {
+		a.setTextNoFlicker(a.periodCountLabel, "每"+periodUnitName(layout.PeriodName)+"分组数")
+	}
+	a.setTextNoFlicker(a.filesPerLeafLabel, "每目录文件数")
+}
+
+func periodUnitName(periodName string) string {
+	switch periodName {
+	case "年份":
+		return "年"
+	case "月份":
+		return "月"
+	default:
+		return periodName
+	}
 }
 
 func hierarchyRuleExample(rule hierarchyRule) string {

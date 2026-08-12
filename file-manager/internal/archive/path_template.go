@@ -22,16 +22,27 @@ type calendarPosition struct {
 	year, quarter, month, leaf int
 }
 
+type TemplateLayout struct {
+	PeriodName     string
+	PeriodsPerYear int
+	HasSequence    bool
+	temporalRank   int
+}
+
 func CalendarLeafPathForConfig(cfg PlanConfig, leafIndex int) string {
 	cfg = NormalizePlanConfig(cfg)
 	if leafIndex < 1 {
 		return ""
 	}
-	position := calendarPositionForIndex(cfg.StartYear, leafIndex, cfg.LeafDirsPerMonth)
 	parts, err := pathTemplateParts(cfg.PathTemplate)
 	if err != nil {
 		return ""
 	}
+	layout, err := analyzePathTemplateParts(parts)
+	if err != nil {
+		return ""
+	}
+	position := calendarPositionForIndex(cfg, leafIndex, layout)
 	for index, part := range parts {
 		parts[index] = renderPathTemplatePart(part, position)
 	}
@@ -68,17 +79,41 @@ func CalendarLeafIndex(relativeLeafPath string, cfg PlanConfig) (int, bool) {
 		}
 	}
 
+	layout, err := analyzePathTemplateParts(parts)
+	if err != nil {
+		return 0, false
+	}
 	year, yearOK := values["{YYYY}"]
-	month, monthOK := values["{MM}"]
-	leaf, leafOK := values["{NN}"]
-	if !yearOK || !monthOK || !leafOK || year < cfg.StartYear || year > 9999 || month < 1 || month > 12 || leaf < 1 || leaf > cfg.LeafDirsPerMonth {
+	if !yearOK || year < cfg.StartYear || year > 9999 {
 		return 0, false
 	}
-	if quarter, exists := values["{Q}"]; exists && quarter != (month-1)/3+1 {
+	quarter := values["{Q}"]
+	month := values["{MM}"]
+	if layout.temporalRank == 2 && (quarter < 1 || quarter > 4) {
 		return 0, false
 	}
-	monthOffset := (year-cfg.StartYear)*12 + month - 1
-	index := monthOffset*cfg.LeafDirsPerMonth + leaf
+	if layout.temporalRank >= 3 && (month < 1 || month > 12) {
+		return 0, false
+	}
+	if parsedQuarter, exists := values["{Q}"]; exists && layout.temporalRank >= 3 && parsedQuarter != (month-1)/3+1 {
+		return 0, false
+	}
+	periodOffset := year - cfg.StartYear
+	switch layout.temporalRank {
+	case 2:
+		periodOffset = periodOffset*4 + quarter - 1
+	case 3:
+		periodOffset = periodOffset*12 + month - 1
+	}
+	groups := EffectiveLeafDirsPerPeriod(cfg)
+	leaf := 1
+	if layout.HasSequence {
+		leaf = values["{NN}"]
+		if leaf < 1 || leaf > groups {
+			return 0, false
+		}
+	}
+	index := periodOffset*groups + leaf
 	if index < 1 || !strings.EqualFold(filepath.Clean(relativeLeafPath), CalendarLeafPathForConfig(cfg, index)) {
 		return 0, false
 	}
@@ -94,14 +129,17 @@ func ValidatePathTemplate(template string) error {
 		return fmt.Errorf("目录模板最多支持 8 层")
 	}
 	normalized := strings.Join(parts, `\`)
-	for _, required := range []string{"{YYYY}", "{MM}", "{NN}"} {
-		if !strings.Contains(normalized, required) {
-			return fmt.Errorf("目录模板必须包含 %s", required)
-		}
+	if !strings.Contains(normalized, "{YYYY}") {
+		return fmt.Errorf("目录规则必须包含年份 {YYYY}")
 	}
-	if strings.Count(normalized, "{NN}") != 1 || !strings.Contains(parts[len(parts)-1], "{NN}") {
-		return fmt.Errorf("{NN} 必须且只能出现在最后一层")
+	if strings.Count(normalized, "{NN}") > 1 || (strings.Contains(normalized, "{NN}") && !strings.Contains(parts[len(parts)-1], "{NN}")) {
+		return fmt.Errorf("{NN} 最多使用一次，使用时必须位于最后一层")
 	}
+	if _, err := analyzePathTemplateParts(parts); err != nil {
+		return err
+	}
+	previousRank := 0
+	seen := map[string]bool{}
 	for _, part := range parts {
 		remainder := pathTemplateToken.ReplaceAllString(part, "")
 		if strings.ContainsAny(remainder, "{}") {
@@ -111,8 +149,80 @@ func ValidatePathTemplate(template string) error {
 		if err := validateDirectoryName(sample); err != nil {
 			return err
 		}
+		for _, token := range []string{"{YYYY}", "{Q}", "{MM}"} {
+			if strings.Contains(part, token) {
+				seen[token] = true
+			}
+		}
+		rank := pathPartTemporalRank(part)
+		if rank >= 2 && !seen["{YYYY}"] {
+			return fmt.Errorf("季度或月份之前必须先有年份层")
+		}
+		if rank == 3 && strings.Contains(normalized, "{Q}") && !seen["{Q}"] {
+			return fmt.Errorf("月份必须位于季度之后")
+		}
+		if rank > 0 && rank < previousRank {
+			return fmt.Errorf("目录中的年份、季度、月份必须按从大到小的顺序排列")
+		}
+		if rank > previousRank {
+			previousRank = rank
+		}
 	}
 	return nil
+}
+
+func AnalyzePathTemplate(template string) (TemplateLayout, error) {
+	if err := ValidatePathTemplate(template); err != nil {
+		return TemplateLayout{}, err
+	}
+	parts, _ := pathTemplateParts(template)
+	return analyzePathTemplateParts(parts)
+}
+
+func analyzePathTemplateParts(parts []string) (TemplateLayout, error) {
+	layout := TemplateLayout{PeriodName: "年份", PeriodsPerYear: 1, temporalRank: 1}
+	foundYear := false
+	for _, part := range parts {
+		if strings.Contains(part, "{YYYY}") {
+			foundYear = true
+		}
+		if strings.Contains(part, "{NN}") {
+			layout.HasSequence = true
+		}
+		if rank := pathPartTemporalRank(part); rank > layout.temporalRank {
+			layout.temporalRank = rank
+		}
+	}
+	if !foundYear {
+		return TemplateLayout{}, fmt.Errorf("目录规则必须包含年份 {YYYY}")
+	}
+	switch layout.temporalRank {
+	case 2:
+		layout.PeriodName = "季度"
+		layout.PeriodsPerYear = 4
+	case 3:
+		layout.PeriodName = "月份"
+		layout.PeriodsPerYear = 12
+	}
+	return layout, nil
+}
+
+func EffectiveLeafDirsPerPeriod(cfg PlanConfig) int {
+	cfg = NormalizePlanConfig(cfg)
+	layout, err := AnalyzePathTemplate(cfg.PathTemplate)
+	if err != nil || !layout.HasSequence {
+		return 1
+	}
+	return cfg.LeafDirsPerMonth
+}
+
+func MaximumLeafDirs(cfg PlanConfig) int {
+	cfg = NormalizePlanConfig(cfg)
+	layout, err := AnalyzePathTemplate(cfg.PathTemplate)
+	if err != nil {
+		return 0
+	}
+	return saturatedMultiply(saturatedMultiply(10000-cfg.StartYear, layout.PeriodsPerYear), EffectiveLeafDirsPerPeriod(cfg))
 }
 
 func PathTemplateDepth(template string) int {
@@ -130,10 +240,28 @@ func EffectiveFolderCounts(cfg PlanConfig, requiredYears int) []int {
 		return nil
 	}
 	counts := make([]int, 0, len(parts))
+	layout, _ := analyzePathTemplateParts(parts)
 	previousRank := 0
 	for _, part := range parts {
-		rank := pathPartRank(part)
+		rank := pathPartTemporalRank(part)
 		count := 1
+		if strings.Contains(part, "{NN}") {
+			groups := EffectiveLeafDirsPerPeriod(cfg)
+			switch {
+			case previousRank == 0:
+				count = saturatedMultiply(saturatedMultiply(requiredYears, layout.PeriodsPerYear), groups)
+			case previousRank == layout.temporalRank:
+				count = groups
+			case layout.temporalRank == 3 && previousRank == 1:
+				count = 12 * groups
+			case layout.temporalRank == 3 && previousRank == 2:
+				count = 3 * groups
+			case layout.temporalRank == 2 && previousRank == 1:
+				count = 4 * groups
+			}
+			counts = append(counts, count)
+			continue
+		}
 		switch {
 		case rank == 1 && previousRank == 0:
 			count = requiredYears
@@ -147,14 +275,6 @@ func EffectiveFolderCounts(cfg PlanConfig, requiredYears int) []int {
 			count = 12
 		case rank == 3 && previousRank == 2:
 			count = 3
-		case rank == 4 && previousRank == 0:
-			count = saturatedMultiply(saturatedMultiply(requiredYears, 12), cfg.LeafDirsPerMonth)
-		case rank == 4 && previousRank == 1:
-			count = 12 * cfg.LeafDirsPerMonth
-		case rank == 4 && previousRank == 2:
-			count = 3 * cfg.LeafDirsPerMonth
-		case rank == 4 && previousRank == 3:
-			count = cfg.LeafDirsPerMonth
 		}
 		counts = append(counts, count)
 		if rank > previousRank {
@@ -190,16 +310,24 @@ func splitRelativePath(path string) []string {
 	return strings.Split(path, `\`)
 }
 
-func calendarPositionForIndex(startYear, leafIndex, leafDirsPerMonth int) calendarPosition {
+func calendarPositionForIndex(cfg PlanConfig, leafIndex int, layout TemplateLayout) calendarPosition {
+	groups := EffectiveLeafDirsPerPeriod(cfg)
 	zero := leafIndex - 1
-	monthOffset := zero / leafDirsPerMonth
-	month := monthOffset%12 + 1
-	return calendarPosition{
-		year:    startYear + monthOffset/12,
-		quarter: (month-1)/3 + 1,
-		month:   month,
-		leaf:    zero%leafDirsPerMonth + 1,
+	periodOffset := zero / groups
+	position := calendarPosition{year: cfg.StartYear, quarter: 1, month: 1, leaf: zero%groups + 1}
+	switch layout.temporalRank {
+	case 1:
+		position.year += periodOffset
+	case 2:
+		position.year += periodOffset / 4
+		position.quarter = periodOffset%4 + 1
+		position.month = (position.quarter-1)*3 + 1
+	case 3:
+		position.year += periodOffset / 12
+		position.month = periodOffset%12 + 1
+		position.quarter = (position.month-1)/3 + 1
 	}
+	return position
 }
 
 func renderPathTemplatePart(part string, position calendarPosition) string {
@@ -251,6 +379,19 @@ func pathPartRank(part string) int {
 	switch {
 	case strings.Contains(part, "{NN}"):
 		return 4
+	case strings.Contains(part, "{MM}"):
+		return 3
+	case strings.Contains(part, "{Q}"):
+		return 2
+	case strings.Contains(part, "{YYYY}"):
+		return 1
+	default:
+		return 0
+	}
+}
+
+func pathPartTemporalRank(part string) int {
+	switch {
 	case strings.Contains(part, "{MM}"):
 		return 3
 	case strings.Contains(part, "{Q}"):

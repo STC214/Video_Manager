@@ -1,6 +1,7 @@
 package archive
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -139,7 +140,6 @@ func TestCustomPathTemplateMoveAndUndo(t *testing.T) {
 
 func TestValidatePathTemplateRejectsUnsafeOrAmbiguousRules(t *testing.T) {
 	tests := []string{
-		`{YYYY}\{YYYY}{MM}`,
 		`{YYYY}\{YYYY}{MM}\{NN}\extra`,
 		`{YYYY}\\{YYYY}{MM}\{NN}`,
 		`{YYYY}\bad:name\{YYYY}{MM}\{NN}`,
@@ -151,6 +151,88 @@ func TestValidatePathTemplateRejectsUnsafeOrAmbiguousRules(t *testing.T) {
 		if err := ValidatePathTemplate(template); err == nil {
 			t.Errorf("ValidatePathTemplate(%q) succeeded, want error", template)
 		}
+	}
+}
+
+func TestPathTemplateSupportsYearAndQuarterAsFinalContainer(t *testing.T) {
+	cfg := PlanConfig{
+		StartYear:        2021,
+		LeafDirsPerMonth: 99,
+		FilesPerLeaf:     10,
+		PathTemplate:     `{YYYY}\{YYYY}S{Q}`,
+	}
+	if err := ValidatePathTemplate(cfg.PathTemplate); err != nil {
+		t.Fatal(err)
+	}
+	if got := CalendarLeafPathForConfig(cfg, 1); got != filepath.Join("2021", "2021S1") {
+		t.Fatalf("first path = %q", got)
+	}
+	if got := CalendarLeafPathForConfig(cfg, 5); got != filepath.Join("2022", "2022S1") {
+		t.Fatalf("fifth path = %q", got)
+	}
+	for index := 1; index <= 8; index++ {
+		path := CalendarLeafPathForConfig(cfg, index)
+		if got, ok := CalendarLeafIndex(path, cfg); !ok || got != index {
+			t.Fatalf("round trip %d: %q -> %d, %v", index, path, got, ok)
+		}
+	}
+	if groups := EffectiveLeafDirsPerPeriod(cfg); groups != 1 {
+		t.Fatalf("groups = %d, want 1 because template has no NN", groups)
+	}
+	result := CalculateCapacity(41, cfg)
+	if result.PeriodName != "季度" || result.RequiredLeafDirs != 5 || result.RequiredQuarters != 5 || result.RequiredYears != 2 || result.FilesPerPeriod != 10 {
+		t.Fatalf("unexpected capacity: %+v", result)
+	}
+}
+
+func TestYearQuarterPlanIgnoresMonthGroupSetting(t *testing.T) {
+	target := t.TempDir()
+	files := make([]VideoFile, 11)
+	for index := range files {
+		files[index] = VideoFile{SourcePath: fmt.Sprintf("source-%02d.pdf", index), Name: fmt.Sprintf("source-%02d.pdf", index), Ext: ".pdf", Size: 1}
+	}
+	cfg := PlanConfig{TargetDir: target, StartYear: 2026, LeafDirsPerMonth: 99, FilesPerLeaf: 10, PathTemplate: `{YYYY}\{YYYY}S{Q}`, Extensions: []string{".pdf"}}
+	plan := BuildMovePlanContext(t.Context(), files, cfg)
+	if plan.ErrorCount != 0 || len(plan.Items) != 11 {
+		t.Fatalf("unexpected plan: %+v", plan)
+	}
+	if got, want := filepath.Dir(plan.Items[0].TargetPath), filepath.Join(target, "2026", "2026S1"); got != want {
+		t.Fatalf("first dir = %q, want %q", got, want)
+	}
+	if got, want := filepath.Dir(plan.Items[10].TargetPath), filepath.Join(target, "2026", "2026S2"); got != want {
+		t.Fatalf("eleventh dir = %q, want %q", got, want)
+	}
+	if plan.RequiredLeafDirs != 2 || plan.TargetDirCount != 2 {
+		t.Fatalf("unexpected directory counts: %+v", plan)
+	}
+}
+
+func TestPathTemplateSupportsYearOnlyAsFinalContainer(t *testing.T) {
+	cfg := PlanConfig{StartYear: 2021, LeafDirsPerMonth: 9, FilesPerLeaf: 30, PathTemplate: `{YYYY}`}
+	if err := ValidatePathTemplate(cfg.PathTemplate); err != nil {
+		t.Fatal(err)
+	}
+	if got := CalendarLeafPathForConfig(cfg, 3); got != "2023" {
+		t.Fatalf("path = %q, want 2023", got)
+	}
+	result := CalculateCapacity(61, cfg)
+	if result.RequiredYears != 3 || result.RequiredLeafDirs != 3 || result.FilesPerYear != 30 {
+		t.Fatalf("unexpected capacity: %+v", result)
+	}
+}
+
+func TestPathTemplateSupportsQuarterGroupsWithoutMonths(t *testing.T) {
+	cfg := PlanConfig{StartYear: 2021, LeafDirsPerMonth: 2, FilesPerLeaf: 10, PathTemplate: `{YYYY}\{YYYY}S{Q}\第{NN}组`}
+	want := filepath.Join("2021", "2021S2", "第01组")
+	if got := CalendarLeafPathForConfig(cfg, 3); got != want {
+		t.Fatalf("path = %q, want %q", got, want)
+	}
+	if index, ok := CalendarLeafIndex(want, cfg); !ok || index != 3 {
+		t.Fatalf("round trip = %d, %v", index, ok)
+	}
+	result := CalculateCapacity(21, cfg)
+	if result.RequiredLeafDirs != 3 || result.RequiredQuarters != 2 || result.RequiredYears != 1 || result.FilesPerPeriod != 20 {
+		t.Fatalf("unexpected capacity: %+v", result)
 	}
 }
 

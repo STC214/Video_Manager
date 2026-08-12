@@ -55,6 +55,35 @@ func TestThreeLayerDefaultOmitsQuarter(t *testing.T) {
 	}
 }
 
+func TestTwoLayerDefaultUsesYearAndQuarterDirectly(t *testing.T) {
+	template, err := hierarchyTemplateFromRules(defaultHierarchyRules(2))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := `{YYYY}\{YYYY}S{Q}`
+	if template != want {
+		t.Fatalf("template = %q, want %q", template, want)
+	}
+	layout, err := archive.AnalyzePathTemplate(template)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if layout.PeriodName != "季度" || layout.HasSequence {
+		t.Fatalf("layout = %+v, want quarter without sequence", layout)
+	}
+}
+
+func TestArchiveRuleSummaryAdaptsToFinalPeriod(t *testing.T) {
+	quarter := archive.PlanConfig{StartYear: 2026, LeafDirsPerMonth: 9, FilesPerLeaf: 30, PathTemplate: `{YYYY}\{YYYY}S{Q}`}
+	if got := archiveRuleSummary(quarter); got != "目录规则: 从 2026 年开始，以季度目录作为最终容器，每个目录最多 30 个文件。" {
+		t.Fatalf("quarter summary = %q", got)
+	}
+	monthGroups := archive.PlanConfig{StartYear: 2026, LeafDirsPerMonth: 4, FilesPerLeaf: 30, PathTemplate: `{YYYY}\{YYYY}{MM}\第{NN}组`}
+	if got := archiveRuleSummary(monthGroups); got != "目录规则: 从 2026 年开始，每月 4 个分组目录，每个目录最多 30 个文件。" {
+		t.Fatalf("month summary = %q", got)
+	}
+}
+
 func TestFiveLayerFixedNameTemplate(t *testing.T) {
 	rules := defaultHierarchyRules(5)
 	rules[1].value = "作品归档"

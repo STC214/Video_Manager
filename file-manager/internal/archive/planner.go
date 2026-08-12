@@ -55,7 +55,7 @@ func BuildMovePlanContext(ctx context.Context, files []VideoFile, cfg PlanConfig
 	targetDirs := map[string]struct{}{}
 	leafIndex := 1
 	filesInLeaf := -1
-	maxLeafDirs := (10000 - cfg.StartYear) * 12 * cfg.LeafDirsPerMonth
+	maxLeafDirs := MaximumLeafDirs(cfg)
 	for _, file := range files {
 		if ctx != nil && ctx.Err() != nil {
 			break
@@ -109,8 +109,10 @@ func BuildMovePlanContext(ctx context.Context, files []VideoFile, cfg PlanConfig
 		result.LastLeafFileCount = filesInLeaf
 	}
 	result.RequiredLeafDirs = leafIndex
-	requiredMonths := ceilDiv(leafIndex, cfg.LeafDirsPerMonth)
-	requiredYears := ceilDiv(requiredMonths, 12)
+	groups := EffectiveLeafDirsPerPeriod(cfg)
+	layout, _ := AnalyzePathTemplate(cfg.PathTemplate)
+	requiredPeriods := ceilDiv(leafIndex, groups)
+	requiredYears := ceilDiv(requiredPeriods, layout.PeriodsPerYear)
 	result.EffectiveCapacity = saturatedMultiply(requiredYears, capacity.FilesPerYear)
 	result.EffectiveFolders = EffectiveFolderCounts(cfg, requiredYears)
 	result.TargetDirCount = len(targetDirs)

@@ -24,6 +24,11 @@ type CapacityResult struct {
 	LastLeafFileCount int
 	FilesPerMonth     int
 	FilesPerYear      int
+	PeriodName        string
+	RequiredPeriods   int
+	GroupsPerPeriod   int
+	FilesPerPeriod    int
+	PeriodsPerYear    int
 	PreviewPaths      []string
 }
 
@@ -53,18 +58,32 @@ func CalculateCapacity(totalFiles int, cfg PlanConfig) CapacityResult {
 	if totalFiles < 0 {
 		totalFiles = 0
 	}
+	layout, _ := AnalyzePathTemplate(cfg.PathTemplate)
+	groups := EffectiveLeafDirsPerPeriod(cfg)
 	result := CapacityResult{
-		TotalFiles:    totalFiles,
-		FilesPerMonth: saturatedMultiply(cfg.LeafDirsPerMonth, cfg.FilesPerLeaf),
+		TotalFiles:      totalFiles,
+		PeriodName:      layout.PeriodName,
+		GroupsPerPeriod: groups,
+		PeriodsPerYear:  layout.PeriodsPerYear,
+		FilesPerPeriod:  saturatedMultiply(groups, cfg.FilesPerLeaf),
 	}
-	result.FilesPerYear = saturatedMultiply(result.FilesPerMonth, 12)
+	if layout.PeriodName == "月份" {
+		result.FilesPerMonth = result.FilesPerPeriod
+	}
+	result.FilesPerYear = saturatedMultiply(result.FilesPerPeriod, layout.PeriodsPerYear)
 	if totalFiles == 0 {
 		return result
 	}
 	result.RequiredLeafDirs = ceilDiv(totalFiles, cfg.FilesPerLeaf)
-	result.RequiredMonths = ceilDiv(result.RequiredLeafDirs, cfg.LeafDirsPerMonth)
-	result.RequiredQuarters = ceilDiv(result.RequiredMonths, 3)
-	result.RequiredYears = ceilDiv(result.RequiredMonths, 12)
+	result.RequiredPeriods = ceilDiv(result.RequiredLeafDirs, groups)
+	result.RequiredYears = ceilDiv(result.RequiredPeriods, layout.PeriodsPerYear)
+	switch layout.PeriodName {
+	case "季度":
+		result.RequiredQuarters = result.RequiredPeriods
+	case "月份":
+		result.RequiredMonths = result.RequiredPeriods
+		result.RequiredQuarters = ceilDiv(result.RequiredMonths, 3)
+	}
 	result.LastLeafFileCount = totalFiles % cfg.FilesPerLeaf
 	if result.LastLeafFileCount == 0 {
 		result.LastLeafFileCount = cfg.FilesPerLeaf
@@ -96,7 +115,7 @@ func ValidateConfig(cfg PlanConfig) error {
 		return fmt.Errorf("起始年份必须是 1000 到 9999 的四位数")
 	}
 	if cfg.LeafDirsPerMonth < 1 || cfg.LeafDirsPerMonth > 99 {
-		return fmt.Errorf("每月叶目录数必须在 1 到 99 之间，以保持两位叶目录编号")
+		return fmt.Errorf("每个归档周期的分组数必须在 1 到 99 之间，以保持两位分组编号")
 	}
 	if cfg.FilesPerLeaf < 1 || cfg.FilesPerLeaf > 1000000 {
 		return fmt.Errorf("每个叶目录文件数必须在 1 到 1000000 之间")
@@ -113,7 +132,7 @@ func ValidateConfigForFiles(cfg PlanConfig, totalFiles int) error {
 	}
 	result := CalculateCapacity(totalFiles, cfg)
 	if result.RequiredYears > 0 && cfg.StartYear+result.RequiredYears-1 > 9999 {
-		return fmt.Errorf("当前文件数量会使归档年份超过 9999，请增大每月叶目录数或每叶文件数")
+		return fmt.Errorf("当前文件数量会使归档年份超过 9999，请增大周期内分组数或每目录文件数")
 	}
 	return nil
 }
