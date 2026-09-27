@@ -2,7 +2,9 @@ package archive
 
 import (
 	"bufio"
+	"bytes"
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"io"
@@ -279,6 +281,12 @@ func moveOne(ctx context.Context, item MovePlanItem) (string, error) {
 	if err != nil {
 		return "error", err
 	}
+	if !os.SameFile(sourceInfo, sourceInfo) {
+		return "error", fmt.Errorf("cannot capture source file identity")
+	}
+	if item.SourceInfo != nil && !sameOwnedObject(sourceInfo, item.SourceInfo) {
+		return "error", fmt.Errorf("source file identity changed after dry-run")
+	}
 	if sourceInfo.Size() != item.Size {
 		return "error", fmt.Errorf("source file size changed after dry-run: got %d, planned %d", sourceInfo.Size(), item.Size)
 	}
@@ -335,7 +343,7 @@ func copyVerifyDeleteWithHooks(ctx context.Context, sourcePath, targetPath strin
 		_ = source.Close()
 		return err
 	}
-	if !os.SameFile(openedSourceInfo, openedSourceInfo) || openedSourceInfo.Size() != sourceInfo.Size() ||
+	if !sameOwnedObject(openedSourceInfo, sourceInfo) || openedSourceInfo.Size() != sourceInfo.Size() ||
 		!openedSourceInfo.ModTime().Equal(sourceInfo.ModTime()) {
 		_ = source.Close()
 		return fmt.Errorf("source file changed before copy")
@@ -360,7 +368,8 @@ func copyVerifyDeleteWithHooks(ctx context.Context, sourcePath, targetPath strin
 		return fmt.Errorf("cannot capture staging file identity")
 	}
 	defer removeOwnedStagingFile(stagingPath, stagingInfo)
-	_, copyErr := copyWithContext(ctx, target, source)
+	copiedHash := sha256.New()
+	_, copyErr := copyWithContext(ctx, target, io.TeeReader(source, copiedHash))
 	sourceCloseErr := source.Close()
 	closeErr := target.Close()
 	if copyErr != nil {
@@ -398,9 +407,12 @@ func copyVerifyDeleteWithHooks(ctx context.Context, sourcePath, targetPath strin
 		return fmt.Errorf("source revalidation after copy failed: %w", err)
 	}
 	if currentSourceInfo.Size() != sourceInfo.Size() || !currentSourceInfo.ModTime().Equal(sourceInfo.ModTime()) ||
-		!os.SameFile(currentSourceInfo, openedSourceInfo) {
+		!sameOwnedObject(currentSourceInfo, openedSourceInfo) {
 		return fmt.Errorf("source file changed during copy: size %d -> %d, modification time %s -> %s",
 			sourceInfo.Size(), currentSourceInfo.Size(), sourceInfo.ModTime().Format(time.RFC3339Nano), currentSourceInfo.ModTime().Format(time.RFC3339Nano))
+	}
+	if err := verifyCopiedBytes(ctx, sourcePath, stagingPath, openedSourceInfo, copiedHash.Sum(nil)); err != nil {
+		return err
 	}
 	if err := retryIOPathsWithMissing(ctx, 3, []string{stagingPath}, true, func() error {
 		return setTimes(fsPath(stagingPath), sourceInfo.ModTime(), sourceInfo.ModTime())
@@ -440,6 +452,35 @@ func copyVerifyDeleteWithHooks(ctx context.Context, sourcePath, targetPath strin
 	})
 	if sourceDeleteErr != nil && !os.IsNotExist(sourceDeleteErr) {
 		return handlePublishedCopyDeleteFailure(sourceDeleteErr, targetPath, stagingInfo)
+	}
+	return nil
+}
+
+func verifyCopiedBytes(ctx context.Context, sourcePath, stagingPath string, sourceInfo os.FileInfo, copiedHash []byte) error {
+	for _, path := range []string{sourcePath, stagingPath} {
+		file, err := os.Open(fsPath(path))
+		if err != nil {
+			return fmt.Errorf("copy hash verification open %s: %w", path, err)
+		}
+		if path == sourcePath {
+			current, statErr := file.Stat()
+			if statErr != nil || !sameOwnedObject(current, sourceInfo) {
+				_ = file.Close()
+				return fmt.Errorf("source identity changed during copy hash verification: %v", statErr)
+			}
+		}
+		h := sha256.New()
+		_, copyErr := copyWithContext(ctx, h, file)
+		closeErr := file.Close()
+		if copyErr != nil {
+			return fmt.Errorf("copy hash verification read %s: %w", path, copyErr)
+		}
+		if closeErr != nil {
+			return closeErr
+		}
+		if !bytes.Equal(h.Sum(nil), copiedHash) {
+			return fmt.Errorf("copy hash verification failed: %s", path)
+		}
 	}
 	return nil
 }

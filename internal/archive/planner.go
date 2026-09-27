@@ -94,6 +94,7 @@ type MovePlanItem struct {
 	TargetPath string
 	Size       int64
 	ModTime    time.Time
+	SourceInfo os.FileInfo // Optional scan-time identity; legacy/undo rows may omit it.
 	Conflict   bool
 	Status     string
 	Error      string
@@ -211,6 +212,7 @@ func BuildMovePlanContext(ctx context.Context, files []VideoFile, cfg PlanConfig
 			TargetPath: targetPath,
 			Size:       file.Size,
 			ModTime:    file.ModTime,
+			SourceInfo: file.SourceInfo,
 			Conflict:   conflict,
 			Status:     "planned",
 		})

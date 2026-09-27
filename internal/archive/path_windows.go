@@ -16,6 +16,9 @@ import (
 // a pathname after an identity check. A concurrent path replacement therefore
 // cannot redirect cleanup to another file.
 func removeOwnedFile(path string, owned os.FileInfo) error {
+	if owned == nil || !owned.Mode().IsRegular() {
+		return fmt.Errorf("not an owned regular file: %s", path)
+	}
 	name, err := windows.UTF16PtrFromString(fsPath(path))
 	if err != nil {
 		return err
@@ -32,8 +35,11 @@ func removeOwnedFile(path string, owned os.FileInfo) error {
 	if err != nil {
 		return err
 	}
-	if !os.SameFile(current, owned) {
+	if !sameOwnedObject(current, owned) {
 		return fmt.Errorf("file ownership changed: %s", path)
+	}
+	if !current.Mode().IsRegular() {
+		return fmt.Errorf("file type changed: %s", path)
 	}
 	deleteFlag := byte(1)
 	r1, _, callErr := procSetFileInformationByHandle.Call(uintptr(handle), 4, uintptr(unsafe.Pointer(&deleteFlag)), 1)
@@ -41,6 +47,48 @@ func removeOwnedFile(path string, owned os.FileInfo) error {
 		return fmt.Errorf("delete owned file %s: %w", path, callErr)
 	}
 	return file.Close()
+}
+
+// removeOwnedEmptyDir removes only the directory object observed during the
+// cleanup scan. Windows rejects deletion when it has become non-empty.
+func removeOwnedEmptyDir(path string, owned os.FileInfo) error {
+	if owned == nil || !owned.IsDir() || owned.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("not an owned directory: %s", path)
+	}
+	name, err := windows.UTF16PtrFromString(fsPath(path))
+	if err != nil {
+		return err
+	}
+	handle, err := windows.CreateFile(name, windows.DELETE|0x80,
+		windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE,
+		nil, windows.OPEN_EXISTING, windows.FILE_FLAG_OPEN_REPARSE_POINT|windows.FILE_FLAG_BACKUP_SEMANTICS, 0)
+	if err != nil {
+		return err
+	}
+	file := os.NewFile(uintptr(handle), path)
+	defer func() { _ = file.Close() }()
+	current, err := file.Stat()
+	if err != nil {
+		return err
+	}
+	if !current.IsDir() || current.Mode()&os.ModeSymlink != 0 || !sameOwnedObject(current, owned) {
+		return fmt.Errorf("directory ownership changed: %s", path)
+	}
+	deleteFlag := byte(1)
+	r1, _, callErr := procSetFileInformationByHandle.Call(uintptr(handle), 4, uintptr(unsafe.Pointer(&deleteFlag)), 1)
+	if r1 == 0 {
+		return fmt.Errorf("delete owned empty directory %s: %w", path, callErr)
+	}
+	return file.Close()
+}
+
+func sameOwnedObject(current, owned os.FileInfo) bool {
+	if current == nil || owned == nil || !os.SameFile(current, owned) {
+		return false
+	}
+	a, okA := current.Sys().(*syscall.Win32FileAttributeData)
+	b, okB := owned.Sys().(*syscall.Win32FileAttributeData)
+	return okA && okB && a.CreationTime == b.CreationTime
 }
 
 // renameNoReplace atomically moves a file without replacing a target that

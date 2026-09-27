@@ -167,3 +167,7 @@ go test ./file-manager/...
 ```
 
 构建输出为 `file-manager\dist\FileManager.exe`。运行配置保存在 EXE 同目录的 `file-manager-data\config.json`。
+
+## 删除边界说明
+
+本子项目是独立程序；主项目 Video Manager 的文件删除入口审查见[主项目审查记录](../docs/deletion_safety_audit.md)，其结论不直接覆盖 File Manager 的投料暂存清理实现。

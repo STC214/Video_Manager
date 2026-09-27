@@ -38,6 +38,9 @@ func TestFeedPlanAppendsWithoutMovingExistingFiles(t *testing.T) {
 	if len(audit.Errors) != 0 || audit.RequiresAdoption || audit.Existing != 2 || len(plan.Items) != 3 {
 		t.Fatalf("audit=%+v plan=%+v", audit, plan)
 	}
+	if plan.Items[0].SourceInfo == nil {
+		t.Fatal("feed plan lost scan-time source identity")
+	}
 	for i, item := range plan.Items {
 		leafNo := 2
 		if i == 2 {
@@ -124,6 +127,245 @@ func TestFeedAuditRejectsMissingOrEmptyTarget(t *testing.T) {
 	}
 	if audit := AuditFeedTarget(context.Background(), cfg); len(audit.Errors) == 0 {
 		t.Fatal("empty target accepted")
+	}
+}
+
+func TestFeedAuditIgnoresUnrelatedDirectoriesAndVideos(t *testing.T) {
+	root := t.TempDir()
+	target := filepath.Join(root, "target")
+	leaf := filepath.Join(target, "Batch_001")
+	if err := os.MkdirAll(leaf, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(leaf, "old.mp4"), []byte("old"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	cfg := PlanConfig{TargetDir: target, LevelCount: 1, LevelNames: []string{"Batch"}, FoldersPerLevel: []int{2}, FilesPerLeaf: 2}
+	if err := SaveStructureConfig(context.Background(), cfg); err != nil {
+		t.Fatal(err)
+	}
+	if audit := AuditFeedTarget(context.Background(), cfg); len(audit.Errors) != 0 || len(audit.Dirs) != 1 {
+		t.Fatalf("valid target rejected: %+v", audit)
+	}
+	unexpected := filepath.Join(target, "Other")
+	if err := os.MkdirAll(filepath.Join(unexpected, "PC", "20260205", "BaseballBoy"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	unrelatedVideo := filepath.Join(unexpected, "PC", "20260205", "BaseballBoy", "other.mp4")
+	if err := os.WriteFile(unrelatedVideo, []byte("unrelated"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if audit := AuditFeedTarget(context.Background(), cfg); len(audit.Errors) != 0 || audit.Existing != 1 || len(audit.Dirs) != 1 || audit.LastLeafIndex != 1 || audit.LastLeafCount != 1 {
+		t.Fatalf("unrelated directory affected audit: %+v", audit)
+	}
+	feed := filepath.Join(root, "feed")
+	if err := os.Mkdir(feed, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(feed, "new.mp4"), []byte("new"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	plan, audit := BuildFeedPlanContext(context.Background(), ScanVideos(context.Background(), feed, nil).Files, cfg)
+	if len(audit.Errors) != 0 || len(plan.Items) != 1 || filepath.Dir(plan.Items[0].TargetPath) != leaf {
+		t.Fatalf("feed did not append to matching leaf: audit=%+v plan=%+v", audit, plan)
+	}
+	if data, err := os.ReadFile(unrelatedVideo); err != nil || string(data) != "unrelated" {
+		t.Fatalf("unrelated video changed during dry-run: %q, %v", data, err)
+	}
+}
+
+func TestFeedAuditOnlyCountsFullyMatchingNestedLeaves(t *testing.T) {
+	root := t.TempDir()
+	cfg := PlanConfig{TargetDir: root, LevelCount: 3, LevelNames: []string{"Zone", "Rack", "Slot"}, FoldersPerLevel: []int{2, 2, 2}, FilesPerLeaf: 2}
+	managed := filepath.Join(root, "Zone_01", "Rack_001", "Slot_001")
+	unrelated := filepath.Join(root, "PC", "20260205", "旧资源", "BaseballBoy")
+	wrongLeaf := filepath.Join(root, "Zone_01", "Rack_001", "Other")
+	for _, dir := range []string{managed, unrelated, wrongLeaf} {
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for path, data := range map[string]string{
+		filepath.Join(managed, "old.mp4"):   "managed",
+		filepath.Join(unrelated, "old.mp4"): "unrelated",
+		filepath.Join(wrongLeaf, "old.mp4"): "wrong leaf",
+	} {
+		if err := os.WriteFile(path, []byte(data), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := SaveStructureConfig(context.Background(), cfg); err != nil {
+		t.Fatal(err)
+	}
+	audit := AuditFeedTarget(context.Background(), cfg)
+	if len(audit.Errors) != 0 || audit.Existing != 1 || len(audit.Files) != 1 || audit.LastLeafIndex != 1 || audit.LastLeafCount != 1 || len(audit.Dirs) != 3 {
+		t.Fatalf("unrelated nested videos entered audit: %+v", audit)
+	}
+	if audit.Files[0].SourcePath != filepath.Join(managed, "old.mp4") {
+		t.Fatalf("unexpected managed file: %+v", audit.Files[0])
+	}
+}
+
+func TestFeedAuditUsesExistingEmptyTailDirectory(t *testing.T) {
+	root := t.TempDir()
+	first := filepath.Join(root, "Batch_001")
+	emptyTail := filepath.Join(root, "Batch_003")
+	for _, dir := range []string{first, emptyTail} {
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(first, "old.mp4"), []byte("old"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	cfg := PlanConfig{TargetDir: root, LevelCount: 1, LevelNames: []string{"Batch"}, FoldersPerLevel: []int{3}, FilesPerLeaf: 2}
+	if err := SaveStructureConfig(context.Background(), cfg); err != nil {
+		t.Fatal(err)
+	}
+	feed := filepath.Join(t.TempDir(), "feed")
+	if err := os.Mkdir(feed, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(feed, "new.mp4"), []byte("new"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	plan, audit := BuildFeedPlanContext(context.Background(), ScanVideos(context.Background(), feed, nil).Files, cfg)
+	if len(audit.Errors) != 0 || audit.LastLeafIndex != 3 || audit.LastLeafCount != 0 || len(plan.Items) != 1 {
+		t.Fatalf("empty tail rejected: audit=%+v plan=%+v", audit, plan)
+	}
+	if filepath.Dir(plan.Items[0].TargetPath) != emptyTail {
+		t.Fatalf("append path = %s, want %s", filepath.Dir(plan.Items[0].TargetPath), emptyTail)
+	}
+}
+
+func TestFeedAuditAcceptsPartiallyFilledEarlierLeaf(t *testing.T) {
+	root := t.TempDir()
+	leaf1 := filepath.Join(root, "Batch_001")
+	leaf2 := filepath.Join(root, "Batch_002")
+	for _, dir := range []string{leaf1, leaf2} {
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, path := range []string{filepath.Join(leaf1, "a.mp4"), filepath.Join(leaf2, "b.mp4")} {
+		if err := os.WriteFile(path, []byte("x"), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cfg := PlanConfig{TargetDir: root, LevelCount: 1, LevelNames: []string{"Batch"}, FoldersPerLevel: []int{2}, FilesPerLeaf: 2}
+	if err := SaveStructureConfig(context.Background(), cfg); err != nil {
+		t.Fatal(err)
+	}
+	if audit := AuditFeedTarget(context.Background(), cfg); len(audit.Errors) != 0 || audit.LastLeafIndex != 2 || audit.LastLeafCount != 1 {
+		t.Fatalf("valid sparse target rejected: %+v", audit)
+	}
+	feed := filepath.Join(t.TempDir(), "feed")
+	if err := os.Mkdir(feed, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(feed, "new.mp4"), []byte("new"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	plan, audit := BuildFeedPlanContext(context.Background(), ScanVideos(context.Background(), feed, nil).Files, cfg)
+	if len(audit.Errors) != 0 || len(plan.Items) != 1 || filepath.Dir(plan.Items[0].TargetPath) != leaf2 {
+		t.Fatalf("sparse append plan: audit=%+v plan=%+v", audit, plan)
+	}
+}
+
+func TestFeedPlanAppendsAfterSparseEarlierLeaf(t *testing.T) {
+	root := t.TempDir()
+	feed := filepath.Join(t.TempDir(), "feed")
+	for i, count := range []int{2, 1, 2} {
+		leaf := filepath.Join(root, fmt.Sprintf("Batch_%03d", i+1))
+		if err := os.MkdirAll(leaf, 0755); err != nil {
+			t.Fatal(err)
+		}
+		for j := 0; j < count; j++ {
+			if err := os.WriteFile(filepath.Join(leaf, fmt.Sprintf("old-%d-%d.mp4", i, j)), []byte("x"), 0644); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if err := os.Mkdir(feed, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(feed, "new.mp4"), []byte("new"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	cfg := PlanConfig{TargetDir: root, LevelCount: 1, LevelNames: []string{"Batch"}, FoldersPerLevel: []int{3}, FilesPerLeaf: 2}
+	if err := SaveStructureConfig(context.Background(), cfg); err != nil {
+		t.Fatal(err)
+	}
+	plan, audit := BuildFeedPlanContext(context.Background(), ScanVideos(context.Background(), feed, nil).Files, cfg)
+	if len(audit.Errors) != 0 || audit.LastLeafIndex != 3 || audit.LastLeafCount != 2 || len(plan.Items) != 1 {
+		t.Fatalf("sparse target rejected: audit=%+v plan=%+v", audit, plan)
+	}
+	if want := filepath.Join(root, "Batch_004"); filepath.Dir(plan.Items[0].TargetPath) != want {
+		t.Fatalf("append path = %s, want %s", filepath.Dir(plan.Items[0].TargetPath), want)
+	}
+	if !plan.AutoExpanded || plan.EffectiveFolders[0] != 4 {
+		t.Fatalf("first level should expand for fourth leaf: %+v", plan)
+	}
+}
+
+func TestFeedAuditAcceptsFiveOfThirtyBeforeLaterLeaf(t *testing.T) {
+	root := t.TempDir()
+	for i, count := range []int{30, 5, 1} {
+		leaf := filepath.Join(root, fmt.Sprintf("SHV_%03d", i+1))
+		if err := os.MkdirAll(leaf, 0755); err != nil {
+			t.Fatal(err)
+		}
+		for j := 0; j < count; j++ {
+			if err := os.WriteFile(filepath.Join(leaf, fmt.Sprintf("v-%d-%d.mp4", i, j)), []byte("x"), 0644); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	cfg := PlanConfig{TargetDir: root, LevelCount: 1, LevelNames: []string{"SHV"}, FoldersPerLevel: []int{3}, FilesPerLeaf: 30}
+	if err := SaveStructureConfig(context.Background(), cfg); err != nil {
+		t.Fatal(err)
+	}
+	audit := AuditFeedTarget(context.Background(), cfg)
+	if len(audit.Errors) != 0 || audit.Existing != 36 || audit.LastLeafIndex != 3 || audit.LastLeafCount != 1 {
+		t.Fatalf("5/30 historical leaf rejected: %+v", audit)
+	}
+}
+
+func TestFeedPlanFillsTailBeforeCreatingNextLeaf(t *testing.T) {
+	root := t.TempDir()
+	target := filepath.Join(root, "target")
+	feed := filepath.Join(root, "feed")
+	first := filepath.Join(target, "Batch_001")
+	for _, dir := range []string{first, feed} {
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(first, "old.mp4"), []byte("old"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"new1.mp4", "new2.mp4"} {
+		if err := os.WriteFile(filepath.Join(feed, name), []byte(name), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cfg := PlanConfig{TargetDir: target, LevelCount: 1, LevelNames: []string{"Batch"}, FoldersPerLevel: []int{2}, FilesPerLeaf: 2}
+	if err := SaveStructureConfig(context.Background(), cfg); err != nil {
+		t.Fatal(err)
+	}
+	plan, audit := BuildFeedPlanContext(context.Background(), ScanVideos(context.Background(), feed, nil).Files, cfg)
+	if len(audit.Errors) != 0 || len(plan.Items) != 2 {
+		t.Fatalf("plan audit: %+v %+v", audit, plan)
+	}
+	if filepath.Dir(plan.Items[0].TargetPath) != first || filepath.Dir(plan.Items[1].TargetPath) != filepath.Join(target, "Batch_002") {
+		t.Fatalf("append paths: %+v", plan.Items)
+	}
+	summary := ExecuteMovePlan(context.Background(), plan, MoveOptions{}, nil)
+	if summary.Moved != 2 || summary.Failed != 0 {
+		t.Fatalf("append move: %+v", summary)
+	}
+	if final := AuditFeedTarget(context.Background(), cfg); len(final.Errors) != 0 || final.Existing != 3 {
+		t.Fatalf("final structure: %+v", final)
 	}
 }
 
@@ -358,7 +600,7 @@ func TestCorruptStructureSidecarDoesNotBlockFileUndo(t *testing.T) {
 	}
 }
 
-func TestFeedAuditRejectsHoleAndOverfullLeaf(t *testing.T) {
+func TestFeedAuditAcceptsHistoricalNumberingGap(t *testing.T) {
 	root := t.TempDir()
 	cfg := PlanConfig{TargetDir: root, LevelCount: 1, LevelNames: []string{"Batch"}, FoldersPerLevel: []int{3}, FilesPerLeaf: 2}
 	leaf := filepath.Join(root, "Batch_002")
@@ -369,8 +611,25 @@ func TestFeedAuditRejectsHoleAndOverfullLeaf(t *testing.T) {
 		t.Fatal(err)
 	}
 	audit := AuditFeedTarget(context.Background(), cfg)
-	if len(audit.Errors) == 0 {
-		t.Fatal("expected structural error")
+	if len(audit.Errors) != 0 || audit.LastLeafIndex != 2 || audit.LastLeafCount != 1 {
+		t.Fatalf("historical numbering gap rejected: %+v", audit)
+	}
+}
+
+func TestFeedAuditRejectsOverfullLeaf(t *testing.T) {
+	root := t.TempDir()
+	leaf := filepath.Join(root, "Batch_001")
+	if err := os.MkdirAll(leaf, 0755); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 3; i++ {
+		if err := os.WriteFile(filepath.Join(leaf, fmt.Sprintf("old-%d.mp4", i)), []byte("x"), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cfg := PlanConfig{TargetDir: root, LevelCount: 1, LevelNames: []string{"Batch"}, FoldersPerLevel: []int{1}, FilesPerLeaf: 2}
+	if audit := AuditFeedTarget(context.Background(), cfg); len(audit.Errors) == 0 {
+		t.Fatal("overfull leaf accepted")
 	}
 }
 

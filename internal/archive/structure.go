@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -210,6 +211,42 @@ func readStructureSidecar(ctx context.Context, manifestPath string) (*structureI
 	return &intent, nil
 }
 
+func removeMatchingStructureSidecar(manifestPath string, expected structureIntent) error {
+	path := structureIntentPath(manifestPath)
+	file, err := os.Open(fsPath(path))
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	info, err := file.Stat()
+	if err != nil {
+		_ = file.Close()
+		return err
+	}
+	if !os.SameFile(info, info) {
+		_ = file.Close()
+		return fmt.Errorf("cannot capture structure intent identity: %s", path)
+	}
+	data, err := io.ReadAll(file)
+	closeErr := file.Close()
+	if err != nil {
+		return err
+	}
+	if closeErr != nil {
+		return closeErr
+	}
+	var current structureIntent
+	if err := json.Unmarshal(data, &current); err != nil {
+		return err
+	}
+	if !SamePath(current.Root, expected.Root) || !SamePath(current.Path, expected.Path) || current.Hash != expected.Hash {
+		return fmt.Errorf("structure intent changed: %s", path)
+	}
+	return removeOwnedFile(path, info)
+}
+
 func saveStructureConfig(ctx context.Context, cfg PlanConfig, run string) (bool, error) {
 	record := structureFromConfig(cfg)
 	record.BindingRun = run
@@ -303,14 +340,11 @@ func removeOwnedStructureIntent(ctx context.Context, manifestPath string, intent
 	if record.BaselineHash == "" {
 		return nil // Older bindings lack a reliable pre-run snapshot.
 	}
-	scan := ScanVideos(ctx, intent.Root, []string{filepath.Join(intent.Root, "_video-manager")})
-	if scan.Cancelled {
-		return ctx.Err()
+	audit := AuditFeedTarget(ctx, planConfigFromStructure(intent.Root, record))
+	if len(audit.Errors) > 0 {
+		return fmt.Errorf("目标目录复审失败: %s", audit.Errors[0])
 	}
-	if scan.ErrorCount > 0 {
-		return fmt.Errorf("目标目录复审存在 %d 个读取错误", scan.ErrorCount)
-	}
-	if snapshotVideoFiles(scan.Files) != record.BaselineHash {
+	if snapshotVideoFiles(audit.Files) != record.BaselineHash {
 		// The owner was undone, but later feeds still depend on this record.
 		// Leave a durable intent so the last later undo can finish cleanup.
 		data, err := json.Marshal(deferredStructureRemoval{BindingRun: record.BindingRun, Hash: intent.Hash})
@@ -365,20 +399,21 @@ func removeDeferredStructureMarker(ctx context.Context, root string) error {
 	if record.BindingRun != deferred.BindingRun || fmt.Sprintf("%x", sha256.Sum256(markerData)) != deferred.Hash {
 		return nil // A changed structure record is not ours to remove.
 	}
-	scan := ScanVideos(ctx, root, []string{filepath.Join(root, "_video-manager")})
-	if scan.Cancelled {
-		return ctx.Err()
+	audit := AuditFeedTarget(ctx, planConfigFromStructure(root, record))
+	if len(audit.Errors) > 0 {
+		return fmt.Errorf("目标目录复审失败: %s", audit.Errors[0])
 	}
-	if scan.ErrorCount > 0 {
-		return fmt.Errorf("cannot rescan target for deferred structure cleanup: %d errors", scan.ErrorCount)
-	}
-	if snapshotVideoFiles(scan.Files) != record.BaselineHash {
+	if snapshotVideoFiles(audit.Files) != record.BaselineHash {
 		return nil
 	}
 	if err := removeStructureFile(markerPath); err != nil {
 		return err
 	}
 	return removeStructureFile(intentPath)
+}
+
+func planConfigFromStructure(root string, record structureRecord) PlanConfig {
+	return PlanConfig{TargetDir: root, LevelCount: record.LevelCount, LevelNames: record.LevelNames, FoldersPerLevel: record.FoldersPerLevel, FilesPerLeaf: record.FilesPerLeaf}
 }
 
 func removeStructureFile(path string) error {

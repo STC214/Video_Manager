@@ -143,6 +143,7 @@ type app struct {
 	dryRunLines              []string
 	dryRunPage               int
 	dryRunNetwork            bool
+	dryRunIsFeed             bool
 	browsing                 bool
 	browseKind               int
 	browsePath               string
@@ -993,6 +994,7 @@ func (a *app) generateDryRun() {
 	networkRead := archive.IsLikelyNetworkPath(sourceRoot) || archive.IsLikelyNetworkPath(targetRoot)
 	a.mu.Lock()
 	a.dryRunNetwork = networkRead
+	a.dryRunIsFeed = false
 	a.mu.Unlock()
 	if networkRead {
 		a.log("检测到网络路径，Dry-run 校验会给予 SMB/UNC 更长等待时间。")
@@ -1112,6 +1114,7 @@ func (a *app) finishDryRun() {
 	hasManifest := a.lastManifestAvailable
 	networkRead := a.dryRunNetwork
 	a.dryRunNetwork = false
+	a.dryRunIsFeed = false
 	a.mu.Unlock()
 	if networkRead {
 		a.setProgressBusy(false)
@@ -1166,11 +1169,15 @@ func (a *app) postDryRunProgress(done int) {
 func (a *app) showDryRunProgress(done int) {
 	a.mu.Lock()
 	networkRead := a.dryRunNetwork
+	isFeed := a.dryRunIsFeed
 	a.mu.Unlock()
 	if !networkRead {
 		a.setProgress(done, 4)
 	}
 	status := dryRunProgressMessage(done)
+	if isFeed {
+		status = feedDryRunProgressMessage(done)
+	}
 	if status != "" {
 		a.log(status)
 	}
@@ -1186,6 +1193,21 @@ func dryRunProgressMessage(done int) string {
 		return "Dry-run 进度 3/4: 空目录预览完成。"
 	case 4:
 		return "Dry-run 进度 4/4: TSV 导出完成。"
+	default:
+		return ""
+	}
+}
+
+func feedDryRunProgressMessage(done int) string {
+	switch done {
+	case 1:
+		return "投料 Dry-run 进度 1/4: 投料目录扫描完成。"
+	case 2:
+		return "投料 Dry-run 进度 2/4: 现有结构审计和追加计划完成。"
+	case 3:
+		return "投料 Dry-run 进度 3/4: 空源目录预览完成。"
+	case 4:
+		return "投料 Dry-run 进度 4/4: TSV 导出完成。"
 	default:
 		return ""
 	}
@@ -1343,6 +1365,22 @@ func (a *app) startMove() {
 				win.PostMessage(a.hwnd, wmMoveComplete, 0, 0)
 				return
 			}
+			catalogPath, catalogCreated, catalogErr := archive.EnsureFeedArchiveCSV(ctx, planCfg, audit, targetLock)
+			if catalogErr != nil {
+				a.mu.Lock()
+				a.moveSummary = archive.MoveSummary{Total: len(plan.Items), Failed: len(plan.Items), Error: "投料前建立目标档案失败，尚未移动文件: " + catalogErr.Error()}
+				a.moving = false
+				a.moveCancel = nil
+				a.mu.Unlock()
+				win.PostMessage(a.hwnd, wmMoveComplete, 0, 0)
+				return
+			}
+			if catalogCreated {
+				a.mu.Lock()
+				a.moveStatus = "已建立目标原有文件档案: " + catalogPath
+				a.mu.Unlock()
+				win.PostMessage(a.hwnd, wmMoveProgress, 0, 0)
+			}
 		} else if err := archive.CheckNormalTargetContext(ctx, planCfg); err != nil {
 			a.mu.Lock()
 			a.moveSummary = archive.MoveSummary{Total: len(plan.Items), Failed: len(plan.Items), Error: "普通归档目标复审失败: " + err.Error()}
@@ -1387,7 +1425,7 @@ func (a *app) startMove() {
 				summary.Error += "文件已移动，但结构记录提交失败: " + err.Error()
 			}
 		}
-		if !summary.Cancelled && summary.Error == "" && summary.Moved > 0 && sourceRoot != "" {
+		if shouldCleanupSourceAfterMove(summary, sourceRoot) {
 			if archive.IsLikelyNetworkPath(sourceRoot) {
 				a.mu.Lock()
 				a.moveProgressBusy = true
@@ -1411,6 +1449,10 @@ func (a *app) startMove() {
 		a.mu.Unlock()
 		win.PostMessage(a.hwnd, wmMoveComplete, 0, 0)
 	}()
+}
+
+func shouldCleanupSourceAfterMove(summary archive.MoveSummary, sourceRoot string) bool {
+	return !summary.Cancelled && summary.Error == "" && summary.Failed == 0 && summary.Moved > 0 && strings.TrimSpace(sourceRoot) != ""
 }
 
 func (a *app) cancelActiveTask() {

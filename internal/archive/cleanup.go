@@ -66,8 +66,17 @@ func CleanupEmptyDirs(ctx context.Context, root string, protectedRoots []string)
 		if len(entries) != 0 {
 			continue
 		}
+		owned, err := os.Lstat(fsPath(dir))
+		if err != nil {
+			errors = appendLimited(errors, dir+": "+err.Error(), 20)
+			continue
+		}
+		if !os.SameFile(owned, owned) {
+			errors = appendLimited(errors, dir+": cannot capture directory identity", 20)
+			continue
+		}
 		if err := retryIOPaths(ctx, 3, []string{dir}, func() error {
-			return os.Remove(fsPath(dir))
+			return removeOwnedEmptyDir(dir, owned)
 		}); err != nil {
 			errors = appendLimited(errors, dir+": "+err.Error(), 20)
 			continue

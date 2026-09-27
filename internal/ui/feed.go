@@ -12,12 +12,17 @@ import (
 )
 
 func sameFeedAudit(left, right archive.FeedAudit) bool {
-	if left.Existing != right.Existing || left.RequiresAdoption != right.RequiresAdoption || len(left.Files) != len(right.Files) {
+	if left.Existing != right.Existing || left.LastLeafIndex != right.LastLeafIndex || left.LastLeafCount != right.LastLeafCount || left.RequiresAdoption != right.RequiresAdoption || len(left.Files) != len(right.Files) || len(left.Dirs) != len(right.Dirs) {
 		return false
+	}
+	for i := range left.Dirs {
+		if !archive.SamePath(left.Dirs[i], right.Dirs[i]) {
+			return false
+		}
 	}
 	for i := range left.Files {
 		a, b := left.Files[i], right.Files[i]
-		if !archive.SamePath(a.SourcePath, b.SourcePath) || a.Size != b.Size || !a.ModTime.Equal(b.ModTime) {
+		if !archive.SamePath(a.SourcePath, b.SourcePath) || a.Size != b.Size || !a.ModTime.Equal(b.ModTime) || !archive.SameVideoIdentity(a, b) {
 			return false
 		}
 	}
@@ -62,6 +67,7 @@ func (a *app) generateFeedDryRun() {
 	a.currentPlanFeed = false
 	a.dryRunLines, a.dryRunTSV, a.dryRunError = nil, "", ""
 	a.dryRunNetwork = archive.IsLikelyNetworkPath(feedRoot) || archive.IsLikelyNetworkPath(targetRoot)
+	a.dryRunIsFeed = true
 	a.mu.Unlock()
 	a.setConfigurationEnabled(false)
 	a.setActionState(false, false, false, true, false)
@@ -102,7 +108,7 @@ func (a *app) generateFeedDryRun() {
 			return
 		}
 		a.postDryRunProgress(2)
-		lines := []string{fmt.Sprintf("投料 Dry-run：现有 %d，新增 %d，完成后 %d；重名 %d，错误 %d。", audit.Existing, len(scan.Files), plan.FinalTargetFiles, plan.ConflictCount, plan.ErrorCount), "现有文件保持原位；新文件从末尾叶目录续排，满额后建立同规则新目录。", ""}
+		lines := []string{fmt.Sprintf("投料 Dry-run：现有 %d，新增 %d，完成后 %d；重名 %d，错误 %d。", audit.Existing, len(scan.Files), plan.FinalTargetFiles, plan.ConflictCount, plan.ErrorCount), fmt.Sprintf("已核对原结构参数和 %d 个现有结构目录；实际末尾叶目录编号 %d，已有受管视频 %d/%d。", len(audit.Dirs), audit.LastLeafIndex, audit.LastLeafCount, cfg.FilesPerLeaf), "现有文件保持原位；允许历史叶目录未满，新文件只从实际末尾叶目录继续追加。", ""}
 		if audit.RequiresAdoption {
 			lines = append(lines, "旧归档未保存原设定：首次投料时需确认当前参数就是原参数；确认后将绑定到目标目录。")
 		}

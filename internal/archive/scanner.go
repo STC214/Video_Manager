@@ -16,6 +16,17 @@ type VideoFile struct {
 	Ext        string
 	Size       int64
 	ModTime    time.Time
+	SourceInfo os.FileInfo // In-memory identity captured at scan time; not written to TSV.
+}
+
+// SameVideoIdentity compares the scan-time filesystem objects, not only their
+// path, size and modification time. Missing snapshots stay compatible with
+// synthetic plans but never match a real snapshot.
+func SameVideoIdentity(left, right VideoFile) bool {
+	if left.SourceInfo == nil || right.SourceInfo == nil {
+		return left.SourceInfo == nil && right.SourceInfo == nil
+	}
+	return sameOwnedObject(left.SourceInfo, right.SourceInfo)
 }
 
 type ScanResult struct {
@@ -94,6 +105,11 @@ func ScanVideosWithProgress(ctx context.Context, sourceDir string, excludedRoots
 			result.Errors = appendLimited(result.Errors, cleanPath+": "+statErr.Error(), 20)
 			return nil
 		}
+		if !info.Mode().IsRegular() || !os.SameFile(info, info) {
+			result.ErrorCount++
+			result.Errors = appendLimited(result.Errors, cleanPath+": cannot capture regular video file identity", 20)
+			return nil
+		}
 		rel, relErr := filepath.Rel(sourceDir, cleanPath)
 		if relErr != nil {
 			rel = d.Name()
@@ -105,6 +121,7 @@ func ScanVideosWithProgress(ctx context.Context, sourceDir string, excludedRoots
 			Ext:        ext,
 			Size:       info.Size(),
 			ModTime:    info.ModTime(),
+			SourceInfo: info,
 		}
 		result.Files = append(result.Files, file)
 		result.VideoCount++

@@ -54,7 +54,8 @@ func Save(cfg Config) error {
 		return err
 	}
 	tempPath := temp.Name()
-	defer os.Remove(tempPath)
+	// A failed save leaves its uniquely named temp file for inspection. Removing
+	// by pathname here could delete a different file if the name was replaced.
 	if _, err := temp.Write(data); err != nil {
 		_ = temp.Close()
 		return err

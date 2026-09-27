@@ -146,3 +146,18 @@ func TestDryRunProgressMessagesMatchStages(t *testing.T) {
 		}
 	}
 }
+
+func TestFeedDryRunProgressMessagesMatchStages(t *testing.T) {
+	wants := []string{
+		"",
+		"投料 Dry-run 进度 1/4: 投料目录扫描完成。",
+		"投料 Dry-run 进度 2/4: 现有结构审计和追加计划完成。",
+		"投料 Dry-run 进度 3/4: 空源目录预览完成。",
+		"投料 Dry-run 进度 4/4: TSV 导出完成。",
+	}
+	for done, want := range wants {
+		if got := feedDryRunProgressMessage(done); got != want {
+			t.Fatalf("feedDryRunProgressMessage(%d) = %q, want %q", done, got, want)
+		}
+	}
+}

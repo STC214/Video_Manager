@@ -165,7 +165,7 @@ func UndoManifestWithOptions(ctx context.Context, manifestPath string, opts Move
 				summary.Failed++
 				summary.Error = "撤销文件已完成，但结构记录清理失败: " + err.Error()
 			} else if sidecar != nil {
-				if err := os.Remove(fsPath(structureIntentPath(manifestPath))); err != nil && !os.IsNotExist(err) {
+				if err := removeMatchingStructureSidecar(manifestPath, *sidecar); err != nil {
 					summary.Failed++
 					summary.Error = "文件已恢复，但结构意图记录清理失败: " + err.Error()
 				}

@@ -6,16 +6,20 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 )
 
-// FeedAudit verifies that managed files occupy a contiguous sequence of leaves.
-// Existing files are never included in the move plan.
+// FeedAudit verifies numbered leaves and per-leaf capacity without requiring
+// historical leaves to be full. Existing files are never included in the plan.
 type FeedAudit struct {
 	Existing         int
+	LastLeafIndex    int
+	LastLeafCount    int
 	RequiresAdoption bool
 	Errors           []string
 	Files            []VideoFile
+	Dirs             []string
 }
 
 func AuditFeedTarget(ctx context.Context, cfg PlanConfig) FeedAudit {
@@ -23,7 +27,7 @@ func AuditFeedTarget(ctx context.Context, cfg PlanConfig) FeedAudit {
 		ctx = context.Background()
 	}
 	result := FeedAudit{}
-	root := strings.TrimSpace(cfg.TargetDir)
+	root := displayPath(strings.TrimSpace(cfg.TargetDir))
 	if root == "" {
 		result.Errors = append(result.Errors, "目标目录为空")
 		return result
@@ -37,20 +41,6 @@ func AuditFeedTarget(ctx context.Context, cfg PlanConfig) FeedAudit {
 		result.Errors = append(result.Errors, fmt.Sprintf("目标目录不可读取: %v", err))
 		return result
 	}
-	scan := ScanVideos(ctx, root, []string{filepath.Join(root, "_video-manager")})
-	result.Files = scan.Files
-	result.Existing = len(scan.Files)
-	result.Errors = append(result.Errors, scan.Errors...)
-	if scan.Cancelled {
-		result.Errors = append(result.Errors, "目标审计已取消")
-	}
-	if len(result.Errors) > 0 {
-		return result
-	}
-	if result.Existing == 0 {
-		result.Errors = append(result.Errors, "目标目录中没有已归档视频，请先使用普通归档")
-		return result
-	}
 	legacy, err := CheckStructureConfig(ctx, cfg)
 	if err != nil {
 		result.Errors = append(result.Errors, err.Error())
@@ -58,28 +48,121 @@ func AuditFeedTarget(ctx context.Context, cfg PlanConfig) FeedAudit {
 	}
 	result.RequiresAdoption = legacy
 	cfgCap := normalizeCapacityConfig(CapacityConfig{LevelCount: cfg.LevelCount, LevelNames: cfg.LevelNames, FoldersPerLevel: cfg.FoldersPerLevel, FilesPerLeaf: cfg.FilesPerLeaf})
-	counts := map[string]int{}
-	for _, file := range scan.Files {
-		counts[strings.ToLower(filepath.Clean(filepath.Dir(file.SourcePath)))]++
+	if cfgCap.LevelCount < 1 || len(cfgCap.LevelNames) < cfgCap.LevelCount {
+		result.Errors = append(result.Errors, "目标目录结构设置无效")
+		return result
 	}
-	for i := 0; i < result.Existing; i += cfgCap.FilesPerLeaf {
-		leaf := i/cfgCap.FilesPerLeaf + 1
-		expected := filepath.Join(root, filepath.FromSlash(formatPath(cfgCap.LevelNames, pathIndexes(leaf, cfgCap.FoldersPerLevel))))
-		want := cfgCap.FilesPerLeaf
-		if left := result.Existing - i; left < want {
-			want = left
+	seenDirs := map[string]string{}
+	seenLeafIndexes := map[int]struct{}{}
+	err = filepath.WalkDir(fsPath(root), func(path string, entry os.DirEntry, walkErr error) error {
+		if err := ctx.Err(); err != nil {
+			return err
 		}
-		key := strings.ToLower(filepath.Clean(expected))
-		if counts[key] != want {
-			result.Errors = append(result.Errors, fmt.Sprintf("结构不连续或叶目录数量不符: %s，应有 %d，实际 %d", expected, want, counts[key]))
-			return result
+		if walkErr != nil {
+			return walkErr
 		}
-		delete(counts, key)
+		clean := displayPath(path)
+		if SamePath(clean, root) {
+			return nil
+		}
+		if !entry.IsDir() || entry.Type()&os.ModeSymlink != 0 {
+			return nil
+		}
+		rel, relErr := filepath.Rel(root, clean)
+		if relErr != nil {
+			return relErr
+		}
+		depth := len(strings.Split(rel, string(filepath.Separator)))
+		if depth > cfgCap.LevelCount || !feedLevelNameMatches(entry.Name(), cfgCap.LevelNames[depth-1]) {
+			return filepath.SkipDir
+		}
+		if depth < cfgCap.LevelCount {
+			return nil
+		}
+		leaf, parseErr := feedLeafIndex(root, clean, cfgCap)
+		if parseErr != nil {
+			return filepath.SkipDir
+		}
+		if _, exists := seenLeafIndexes[leaf]; exists {
+			return fmt.Errorf("目标目录存在重复编号的叶目录: %d", leaf)
+		}
+		seenLeafIndexes[leaf] = struct{}{}
+		entries, readErr := os.ReadDir(fsPath(clean))
+		if readErr != nil {
+			return readErr
+		}
+		count := 0
+		for _, child := range entries {
+			if child.IsDir() || child.Type()&os.ModeSymlink != 0 || !IsVideoExt(filepath.Ext(child.Name())) {
+				continue
+			}
+			filePath := filepath.Join(clean, child.Name())
+			fileInfo, statErr := child.Info()
+			if statErr != nil {
+				return statErr
+			}
+			if !fileInfo.Mode().IsRegular() || !os.SameFile(fileInfo, fileInfo) {
+				return fmt.Errorf("目标叶目录的视频不是普通文件: %s", filePath)
+			}
+			fileRel, relErr := filepath.Rel(root, filePath)
+			if relErr != nil {
+				return relErr
+			}
+			result.Files = append(result.Files, VideoFile{SourcePath: filePath, RelPath: fileRel, Name: child.Name(), Ext: strings.ToLower(filepath.Ext(child.Name())), Size: fileInfo.Size(), ModTime: fileInfo.ModTime(), SourceInfo: fileInfo})
+			count++
+		}
+		if count > cfgCap.FilesPerLeaf {
+			return fmt.Errorf("叶目录文件数超出上限: %s，实际 %d，上限 %d", clean, count, cfgCap.FilesPerLeaf)
+		}
+		if leaf > result.LastLeafIndex {
+			result.LastLeafIndex = leaf
+			result.LastLeafCount = count
+		}
+		for current := clean; !SamePath(current, root); current = filepath.Dir(current) {
+			seenDirs[strings.ToLower(filepath.Clean(current))] = current
+		}
+		return filepath.SkipDir
+	})
+	if err != nil {
+		result.Errors = append(result.Errors, err.Error())
+		return result
 	}
-	if len(counts) > 0 {
-		result.Errors = append(result.Errors, "目标目录存在不符合当前结构的受管文件")
+	result.Existing = len(result.Files)
+	if result.Existing == 0 {
+		result.Errors = append(result.Errors, "符合当前结构的目录中没有已归档视频，请先使用普通归档")
+		return result
 	}
+	for _, dir := range seenDirs {
+		result.Dirs = append(result.Dirs, dir)
+	}
+	sortVideoFilesByTime(result.Files)
+	sort.Slice(result.Dirs, func(i, j int) bool { return strings.ToLower(result.Dirs[i]) < strings.ToLower(result.Dirs[j]) })
 	return result
+}
+
+func feedLevelNameMatches(name, levelName string) bool {
+	prefix := levelName + "_"
+	if len(name) <= len(prefix) || !strings.EqualFold(name[:len(prefix)], prefix) {
+		return false
+	}
+	index, err := strconv.Atoi(name[len(prefix):])
+	return err == nil && index > 0
+}
+func feedLeafIndex(root, dir string, cfg CapacityConfig) (int, error) {
+	name := filepath.Base(dir)
+	prefix := cfg.LevelNames[len(cfg.LevelNames)-1] + "_"
+	if len(name) < len(prefix) || !strings.EqualFold(name[:len(prefix)], prefix) {
+		return 0, fmt.Errorf("受管文件位于不符合当前结构的目录: %s", dir)
+	}
+	index, err := strconv.Atoi(name[len(prefix):])
+	if err != nil || index < 1 {
+		return 0, fmt.Errorf("叶目录编号无效: %s", dir)
+	}
+	expected := filepath.Join(root, filepath.FromSlash(formatPath(cfg.LevelNames, pathIndexes(index, cfg.FoldersPerLevel))))
+	if !SamePath(dir, expected) {
+		return 0, fmt.Errorf("受管文件目录与原结构不一致: %s，应为 %s", dir, expected)
+	}
+	return index, nil
 }
 
 func BuildFeedPlanContext(ctx context.Context, feedFiles []VideoFile, cfg PlanConfig) (MovePlan, FeedAudit) {
@@ -97,7 +180,11 @@ func BuildFeedPlanContext(ctx context.Context, feedFiles []VideoFile, cfg PlanCo
 	}
 	files := append([]VideoFile(nil), feedFiles...)
 	sortVideoFilesByTime(files)
-	capCfg := normalizeCapacityConfig(CapacityConfig{TotalFiles: audit.Existing + len(files), LevelCount: cfg.LevelCount, LevelNames: cfg.LevelNames, FoldersPerLevel: cfg.FoldersPerLevel, FilesPerLeaf: cfg.FilesPerLeaf})
+	capCfg := normalizeCapacityConfig(CapacityConfig{LevelCount: cfg.LevelCount, LevelNames: cfg.LevelNames, FoldersPerLevel: cfg.FoldersPerLevel, FilesPerLeaf: cfg.FilesPerLeaf})
+	roomInTail := capCfg.FilesPerLeaf - audit.LastLeafCount
+	additionalLeaves := ceilDiv(max(0, len(files)-roomInTail), capCfg.FilesPerLeaf)
+	finalLeaf := audit.LastLeafIndex + additionalLeaves
+	capCfg.TotalFiles = finalLeaf * capCfg.FilesPerLeaf
 	capResult := CalculateCapacity(capCfg)
 	if !capResult.Enough {
 		plan.AutoExpanded = true
@@ -110,14 +197,19 @@ func BuildFeedPlanContext(ctx context.Context, feedFiles []VideoFile, cfg PlanCo
 	plan.EffectiveFolders = capCfg.FoldersPerLevel
 	plan.RequiredLeafDirs = capResult.RequiredLeafDirs
 	plan.FinalTargetFiles = audit.Existing + len(files)
+	plan.LastLeafPath = filepath.Join(cfg.TargetDir, filepath.FromSlash(formatPath(capCfg.LevelNames, pathIndexes(audit.LastLeafIndex, capCfg.FoldersPerLevel))))
+	plan.LastLeafFileCount = audit.LastLeafCount
 	resolver := newTargetResolver(ctx)
 	dirs := map[string]struct{}{}
 	for i, file := range files {
-		leaf := (audit.Existing+i)/capCfg.FilesPerLeaf + 1
+		leaf := audit.LastLeafIndex
+		if i >= roomInTail {
+			leaf += 1 + (i-roomInTail)/capCfg.FilesPerLeaf
+		}
 		dir := filepath.Join(cfg.TargetDir, filepath.FromSlash(formatPath(capCfg.LevelNames, pathIndexes(leaf, capCfg.FoldersPerLevel))))
 		dirs[dir] = struct{}{}
 		path, conflict, err := resolver.uniquePath(filepath.Join(dir, file.Name))
-		item := MovePlanItem{SourcePath: file.SourcePath, TargetPath: path, Size: file.Size, ModTime: file.ModTime, Conflict: conflict, Status: "planned"}
+		item := MovePlanItem{SourcePath: file.SourcePath, TargetPath: path, Size: file.Size, ModTime: file.ModTime, SourceInfo: file.SourceInfo, Conflict: conflict, Status: "planned"}
 		if err != nil {
 			item.Status, item.Error, item.TargetPath = "error", err.Error(), filepath.Join(dir, file.Name)
 			plan.ErrorCount++
