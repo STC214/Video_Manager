@@ -16,6 +16,7 @@ import (
 type MoveOptions struct {
 	ManifestDir     string
 	ReportItemStart bool
+	TargetLock      *TargetMoveLock
 }
 
 type MoveProgress struct {
@@ -28,12 +29,13 @@ type MoveProgress struct {
 }
 
 type MoveSummary struct {
-	Total        int
-	Moved        int
-	Failed       int
-	Cancelled    bool
-	ManifestPath string
-	Error        string
+	Total           int
+	Moved           int
+	Failed          int
+	PendingRecovery bool
+	Cancelled       bool
+	ManifestPath    string
+	Error           string
 }
 
 var errTargetCapacityChanged = errors.New("target directory capacity changed after dry-run")
@@ -46,9 +48,27 @@ var copyBufferPool = sync.Pool{
 }
 
 func ExecuteMovePlan(ctx context.Context, plan MovePlan, opts MoveOptions, onProgress func(MoveProgress)) MoveSummary {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	summary := MoveSummary{Total: len(plan.Items)}
 	if len(plan.Items) == 0 {
 		return summary
+	}
+	if opts.TargetLock != nil {
+		if !opts.TargetLock.validFor(plan.TargetRoot) {
+			summary.Failed = summary.Total
+			summary.Error = "target move lock is not held for this target"
+			return summary
+		}
+	} else {
+		lock, err := AcquireTargetMoveLock(ctx, plan.TargetRoot)
+		if err != nil {
+			summary.Failed = summary.Total
+			summary.Error = "cannot lock target: " + err.Error()
+			return summary
+		}
+		defer lock.Close()
 	}
 
 	if strings.TrimSpace(opts.ManifestDir) == "" {
@@ -75,6 +95,12 @@ func ExecuteMovePlan(ctx context.Context, plan MovePlan, opts MoveOptions, onPro
 		_ = manifest.Close()
 		summary.Failed = summary.Total
 		summary.Error = "cannot initialize manifest: " + err.Error()
+		return summary
+	}
+	if _, err := fmt.Fprintf(writer, "target_root\t%s\t\t0\tfalse\t\t\n", plan.TargetRoot); err != nil {
+		_ = manifest.Close()
+		summary.Failed = summary.Total
+		summary.Error = "cannot record target root: " + err.Error()
 		return summary
 	}
 	if err := flushAndSyncManifest(writer, manifest); err != nil {
@@ -120,6 +146,15 @@ func ExecuteMovePlan(ctx context.Context, plan MovePlan, opts MoveOptions, onPro
 		moveErr := capacityErr
 		if moveErr == nil {
 			status, moveErr = moveOne(ctx, item)
+		}
+		var publishedErr *publishedCopyError
+		if errors.As(moveErr, &publishedErr) {
+			// The already-synced pending row must remain unresolved; recording
+			// a regular error row would hide the published target from recovery.
+			summary.PendingRecovery = true
+			summary.Error = "published copy needs recovery: " + moveErr.Error()
+			summary.Failed += len(plan.Items) - i
+			break
 		}
 		if moveErr != nil {
 			item.Status = "error"
@@ -260,13 +295,13 @@ func moveOne(ctx context.Context, item MovePlanItem) (string, error) {
 	if err := ctx.Err(); err != nil {
 		return "error", err
 	}
-	renameErr := os.Rename(fsPath(item.SourcePath), fsPath(item.TargetPath))
+	renameErr := renameNoReplace(item.SourcePath, item.TargetPath)
 	if renameErr == nil {
 		return "moved", nil
 	}
 	if !isCrossDeviceError(renameErr) {
 		if err := retryIOPathsWithMissing(ctx, 2, []string{item.SourcePath, item.TargetPath}, true, func() error {
-			return os.Rename(fsPath(item.SourcePath), fsPath(item.TargetPath))
+			return renameNoReplace(item.SourcePath, item.TargetPath)
 		}); err == nil {
 			return "moved", nil
 		}
@@ -283,6 +318,9 @@ func copyVerifyDelete(ctx context.Context, sourcePath, targetPath string, source
 }
 
 func copyVerifyDeleteWithHooks(ctx context.Context, sourcePath, targetPath string, sourceInfo os.FileInfo, afterCopy func(), setTimes func(string, time.Time, time.Time) error) error {
+	if sourceInfo.Mode().Perm()&0200 == 0 {
+		return fmt.Errorf("source is read-only; cross-device copy would leave the original undeletable")
+	}
 	var source *os.File
 	err := retryIOPathsWithMissing(ctx, 3, []string{sourcePath}, true, func() error {
 		var openErr error
@@ -292,29 +330,46 @@ func copyVerifyDeleteWithHooks(ctx context.Context, sourcePath, targetPath strin
 	if err != nil {
 		return err
 	}
-	var target *os.File
-	err = retryIOPathsWithMissing(ctx, 3, []string{sourcePath, targetPath}, true, func() error {
-		var openErr error
-		target, openErr = os.OpenFile(fsPath(targetPath), os.O_CREATE|os.O_WRONLY|os.O_EXCL, sourceInfo.Mode())
-		return openErr
-	})
+	openedSourceInfo, err := source.Stat()
 	if err != nil {
 		_ = source.Close()
 		return err
 	}
+	if !os.SameFile(openedSourceInfo, openedSourceInfo) || openedSourceInfo.Size() != sourceInfo.Size() ||
+		!openedSourceInfo.ModTime().Equal(sourceInfo.ModTime()) {
+		_ = source.Close()
+		return fmt.Errorf("source file changed before copy")
+	}
+	// Keep the final name invisible until the copy and metadata are verified.
+	// A failed operation only removes its own unique staging file.
+	target, err := os.CreateTemp(fsPath(filepath.Dir(targetPath)), ".video-manager-copy-*.tmp")
+	if err != nil {
+		_ = source.Close()
+		return err
+	}
+	stagingPath := target.Name()
+	stagingInfo, err := target.Stat()
+	if err != nil {
+		_ = source.Close()
+		_ = target.Close()
+		return err
+	}
+	if !os.SameFile(stagingInfo, stagingInfo) {
+		_ = source.Close()
+		_ = target.Close()
+		return fmt.Errorf("cannot capture staging file identity")
+	}
+	defer removeOwnedStagingFile(stagingPath, stagingInfo)
 	_, copyErr := copyWithContext(ctx, target, source)
 	sourceCloseErr := source.Close()
 	closeErr := target.Close()
 	if copyErr != nil {
-		_ = os.Remove(fsPath(targetPath))
 		return copyErr
 	}
 	if closeErr != nil {
-		_ = os.Remove(fsPath(targetPath))
 		return closeErr
 	}
 	if sourceCloseErr != nil {
-		_ = os.Remove(fsPath(targetPath))
 		return sourceCloseErr
 	}
 	if afterCopy != nil {
@@ -322,17 +377,15 @@ func copyVerifyDeleteWithHooks(ctx context.Context, sourcePath, targetPath strin
 	}
 
 	var targetInfo os.FileInfo
-	err = retryIOPathsWithMissing(ctx, 3, []string{targetPath}, true, func() error {
+	err = retryIOPathsWithMissing(ctx, 3, []string{stagingPath}, true, func() error {
 		var statErr error
-		targetInfo, statErr = os.Stat(fsPath(targetPath))
+		targetInfo, statErr = os.Stat(fsPath(stagingPath))
 		return statErr
 	})
 	if err != nil {
-		_ = os.Remove(fsPath(targetPath))
 		return err
 	}
 	if targetInfo.Size() != sourceInfo.Size() {
-		_ = os.Remove(fsPath(targetPath))
 		return fmt.Errorf("copy verify failed: source size %d, target size %d", sourceInfo.Size(), targetInfo.Size())
 	}
 	var currentSourceInfo os.FileInfo
@@ -342,42 +395,69 @@ func copyVerifyDeleteWithHooks(ctx context.Context, sourcePath, targetPath strin
 		return statErr
 	})
 	if err != nil {
-		_ = os.Remove(fsPath(targetPath))
 		return fmt.Errorf("source revalidation after copy failed: %w", err)
 	}
-	if currentSourceInfo.Size() != sourceInfo.Size() || !currentSourceInfo.ModTime().Equal(sourceInfo.ModTime()) {
-		_ = os.Remove(fsPath(targetPath))
+	if currentSourceInfo.Size() != sourceInfo.Size() || !currentSourceInfo.ModTime().Equal(sourceInfo.ModTime()) ||
+		!os.SameFile(currentSourceInfo, openedSourceInfo) {
 		return fmt.Errorf("source file changed during copy: size %d -> %d, modification time %s -> %s",
 			sourceInfo.Size(), currentSourceInfo.Size(), sourceInfo.ModTime().Format(time.RFC3339Nano), currentSourceInfo.ModTime().Format(time.RFC3339Nano))
 	}
-	if err := retryIOPathsWithMissing(ctx, 3, []string{targetPath}, true, func() error {
-		return setTimes(fsPath(targetPath), sourceInfo.ModTime(), sourceInfo.ModTime())
+	if err := retryIOPathsWithMissing(ctx, 3, []string{stagingPath}, true, func() error {
+		return setTimes(fsPath(stagingPath), sourceInfo.ModTime(), sourceInfo.ModTime())
 	}); err != nil {
-		_ = os.Remove(fsPath(targetPath))
 		return fmt.Errorf("cannot preserve target modification time: %w", err)
 	}
 	var finalTargetInfo os.FileInfo
-	if err := retryIOPathsWithMissing(ctx, 3, []string{targetPath}, true, func() error {
+	if err := retryIOPathsWithMissing(ctx, 3, []string{stagingPath}, true, func() error {
 		var statErr error
-		finalTargetInfo, statErr = os.Stat(fsPath(targetPath))
+		finalTargetInfo, statErr = os.Stat(fsPath(stagingPath))
 		return statErr
 	}); err != nil {
-		_ = os.Remove(fsPath(targetPath))
 		return fmt.Errorf("cannot verify preserved target metadata: %w", err)
 	}
 	if finalTargetInfo.Size() != sourceInfo.Size() || !finalTargetInfo.ModTime().Equal(sourceInfo.ModTime()) {
-		_ = os.Remove(fsPath(targetPath))
 		return fmt.Errorf("target metadata preservation failed: size %d, time %s; want size %d, time %s",
 			finalTargetInfo.Size(), finalTargetInfo.ModTime().Format(time.RFC3339Nano),
 			sourceInfo.Size(), sourceInfo.ModTime().Format(time.RFC3339Nano))
 	}
-	if err := syncExistingFile(ctx, targetPath); err != nil {
-		_ = os.Remove(fsPath(targetPath))
+	if err := syncExistingFile(ctx, stagingPath); err != nil {
 		return fmt.Errorf("cannot persist preserved target metadata: %w", err)
 	}
-	return retryIOPathsWithMissing(ctx, 3, []string{sourcePath}, true, func() error {
-		return os.Remove(fsPath(sourcePath))
+	if err := os.Chmod(fsPath(stagingPath), sourceInfo.Mode()); err != nil {
+		return fmt.Errorf("cannot preserve target mode: %w", err)
+	}
+	if current, err := os.Stat(fsPath(stagingPath)); err != nil || current.Mode().Perm() != sourceInfo.Mode().Perm() {
+		return fmt.Errorf("cannot verify preserved target mode: %v", err)
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := renameNoReplace(stagingPath, targetPath); err != nil {
+		return fmt.Errorf("cannot publish verified copy: %w", err)
+	}
+	sourceDeleteErr := retryIOPathsWithMissing(ctx, 3, []string{sourcePath}, true, func() error {
+		return removeOwnedFile(sourcePath, openedSourceInfo)
 	})
+	if sourceDeleteErr != nil && !os.IsNotExist(sourceDeleteErr) {
+		return handlePublishedCopyDeleteFailure(sourceDeleteErr, targetPath, stagingInfo)
+	}
+	return nil
+}
+
+type publishedCopyError struct{ error }
+
+func handlePublishedCopyDeleteFailure(sourceErr error, targetPath string, owned os.FileInfo) error {
+	if err := removeOwnedFile(targetPath, owned); err != nil {
+		if os.IsNotExist(err) {
+			return fmt.Errorf("source deletion failed; published copy already absent: %w", sourceErr)
+		}
+		return &publishedCopyError{fmt.Errorf("source deletion failed (%v); published target cleanup failed: %w", sourceErr, err)}
+	}
+	return fmt.Errorf("source deletion failed; published copy removed: %w", sourceErr)
+}
+
+func removeOwnedStagingFile(path string, original os.FileInfo) {
+	_ = removeOwnedFile(path, original)
 }
 
 func syncExistingFile(ctx context.Context, path string) error {

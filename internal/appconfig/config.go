@@ -10,6 +10,7 @@ import (
 type Config struct {
 	SourceDir       string   `json:"sourceDir"`
 	TargetDir       string   `json:"targetDir"`
+	FeedDir         string   `json:"feedDir"`
 	LevelCount      int      `json:"levelCount"`
 	LevelNames      []string `json:"levelNames"`
 	FoldersPerLevel []int    `json:"foldersPerLevel"`

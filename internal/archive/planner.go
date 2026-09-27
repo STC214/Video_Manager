@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -144,6 +145,11 @@ func BuildMovePlanContext(ctx context.Context, files []VideoFile, cfg PlanConfig
 		FilesPerLeaf:    cfg.FilesPerLeaf,
 	}
 	capCfg = normalizeCapacityConfig(capCfg)
+	result.TargetDirFileLimit = capCfg.FilesPerLeaf
+	for ext := range videoExts {
+		result.ManagedExtensions = append(result.ManagedExtensions, ext)
+	}
+	sort.Strings(result.ManagedExtensions)
 	capResult := CalculateCapacity(capCfg)
 	result.RequiredLeafDirs = capResult.RequiredLeafDirs
 	if !capResult.Enough {

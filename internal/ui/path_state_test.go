@@ -88,11 +88,21 @@ func TestPlanErrorMessagesDeduplicatesAndLimits(t *testing.T) {
 }
 
 func TestBrowseCommandDoesNotMarkConfigurationEditedUntilPathChanges(t *testing.T) {
-	if isConfigurationCommand(idBrowse, win.BN_CLICKED) || isConfigurationCommand(idBrowseTarget, win.BN_CLICKED) {
+	if isConfigurationCommand(idBrowse, win.BN_CLICKED) || isConfigurationCommand(idBrowseTarget, win.BN_CLICKED) || isConfigurationCommand(idBrowseFeed, win.BN_CLICKED) {
 		t.Fatal("opening or cancelling a folder picker must not count as a configuration edit")
 	}
-	if !isConfigurationCommand(idSourceEdit, win.EN_CHANGE) || !isConfigurationCommand(idTargetEdit, win.EN_CHANGE) {
+	if !isConfigurationCommand(idSourceEdit, win.EN_CHANGE) || !isConfigurationCommand(idTargetEdit, win.EN_CHANGE) || !isConfigurationCommand(idFeedEdit, win.EN_CHANGE) {
 		t.Fatal("an actual path text change must count as a configuration edit")
+	}
+}
+
+func TestMoveRequiresSuccessfulDryRun(t *testing.T) {
+	plan := archive.MovePlan{Items: []archive.MovePlanItem{{Status: "planned"}}}
+	if !canEnableMove(plan, "", "dry-run.tsv") {
+		t.Fatal("successful plan should enable move")
+	}
+	if canEnableMove(plan, "Dry-run failed", "dry-run.tsv") || canEnableMove(plan, "", "") {
+		t.Fatal("failed or incomplete Dry-run must keep move disabled")
 	}
 }
 
@@ -105,6 +115,9 @@ func TestManifestAfterMoveKeepsOnlyUndoableRun(t *testing.T) {
 	}
 	if got, changed := manifestAfterMove("previous.tsv", archive.MoveSummary{ManifestPath: "new.tsv", Moved: 1}); got != "new.tsv" || !changed {
 		t.Fatalf("successful move result = %q, %v", got, changed)
+	}
+	if got, changed := manifestAfterMove("previous.tsv", archive.MoveSummary{ManifestPath: "pending.tsv", PendingRecovery: true}); got != "pending.tsv" || !changed {
+		t.Fatalf("pending recovery result = %q, %v", got, changed)
 	}
 }
 

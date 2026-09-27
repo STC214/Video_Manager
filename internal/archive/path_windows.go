@@ -2,11 +2,60 @@ package archive
 
 import (
 	"errors"
+	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"syscall"
 	"unsafe"
+
+	"golang.org/x/sys/windows"
 )
+
+// removeOwnedFile marks the open file object for deletion, rather than deleting
+// a pathname after an identity check. A concurrent path replacement therefore
+// cannot redirect cleanup to another file.
+func removeOwnedFile(path string, owned os.FileInfo) error {
+	name, err := windows.UTF16PtrFromString(fsPath(path))
+	if err != nil {
+		return err
+	}
+	handle, err := windows.CreateFile(name, windows.DELETE|0x80, // FILE_READ_ATTRIBUTES
+		windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE,
+		nil, windows.OPEN_EXISTING, windows.FILE_FLAG_OPEN_REPARSE_POINT, 0)
+	if err != nil {
+		return err
+	}
+	file := os.NewFile(uintptr(handle), path)
+	defer func() { _ = file.Close() }()
+	current, err := file.Stat()
+	if err != nil {
+		return err
+	}
+	if !os.SameFile(current, owned) {
+		return fmt.Errorf("file ownership changed: %s", path)
+	}
+	deleteFlag := byte(1)
+	r1, _, callErr := procSetFileInformationByHandle.Call(uintptr(handle), 4, uintptr(unsafe.Pointer(&deleteFlag)), 1)
+	if r1 == 0 {
+		return fmt.Errorf("delete owned file %s: %w", path, callErr)
+	}
+	return file.Close()
+}
+
+// renameNoReplace atomically moves a file without replacing a target that
+// appeared after planning. os.Rename on Windows uses REPLACE_EXISTING.
+func renameNoReplace(source, target string) error {
+	from, err := windows.UTF16PtrFromString(fsPath(source))
+	if err != nil {
+		return err
+	}
+	to, err := windows.UTF16PtrFromString(fsPath(target))
+	if err != nil {
+		return err
+	}
+	return windows.MoveFileEx(from, to, windows.MOVEFILE_WRITE_THROUGH)
+}
 
 const (
 	driveRemote        = 4
@@ -79,6 +128,7 @@ func isCrossDeviceError(err error) bool {
 }
 
 var (
-	kernel32          = syscall.NewLazyDLL("kernel32.dll")
-	procGetDriveTypeW = kernel32.NewProc("GetDriveTypeW")
+	kernel32                       = syscall.NewLazyDLL("kernel32.dll")
+	procGetDriveTypeW              = kernel32.NewProc("GetDriveTypeW")
+	procSetFileInformationByHandle = kernel32.NewProc("SetFileInformationByHandle")
 )

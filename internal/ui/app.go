@@ -44,6 +44,9 @@ const (
 	idUndo         = 1018
 	idPreviewPrev  = 1019
 	idPreviewNext  = 1020
+	idFeedEdit     = 1021
+	idBrowseFeed   = 1022
+	idFeedDryRun   = 1023
 
 	idLevelNameBase   = 1100
 	idLevelFolderBase = 1200
@@ -120,6 +123,9 @@ type app struct {
 	scanResult               archive.ScanResult
 	currentPlan              archive.MovePlan
 	currentPlanConfig        archive.PlanConfig
+	currentPlanSource        string
+	currentPlanFeed          bool
+	currentFeedAudit         archive.FeedAudit
 	moveSummary              archive.MoveSummary
 	undoSummary              archive.UndoSummary
 	moveStatus               string
@@ -250,7 +256,7 @@ func Run() {
 		win.CW_USEDEFAULT,
 		win.CW_USEDEFAULT,
 		1060,
-		720,
+		756,
 		0,
 		0,
 		a.instance,
@@ -434,25 +440,29 @@ func (a *app) createControls() {
 	a.controls[idTargetEdit] = a.edit(idTargetEdit, "", 100, 58, 690, 28, false)
 	a.button(idBrowseTarget, "浏览...", 805, 57, 105, 30)
 	a.button(idDryRun, "生成 Dry-run", 920, 57, 105, 30)
-	a.controls[idProgress] = a.progress(idProgress, 100, 96, 580, 20)
-	a.button(idCancel, "取消", 700, 91, 100, 30)
-	a.button(idMove, "开始移动", 810, 91, 100, 30)
-	a.button(idUndo, "撤销最近", 920, 91, 105, 30)
+	a.label("投料目录", 24, 96, 80, 24)
+	a.controls[idFeedEdit] = a.edit(idFeedEdit, "", 100, 94, 690, 28, false)
+	a.button(idBrowseFeed, "浏览...", 805, 93, 105, 30)
+	a.button(idFeedDryRun, "投料 Dry-run", 920, 93, 105, 30)
+	a.controls[idProgress] = a.progress(idProgress, 100, 132, 580, 20)
+	a.button(idCancel, "取消", 700, 127, 100, 30)
+	a.button(idMove, "开始移动", 810, 127, 100, 30)
+	a.button(idUndo, "撤销最近", 920, 127, 105, 30)
 
-	a.label("归档容量计算器", 24, 136, 180, 24)
-	a.label("目标文件总数", 24, 172, 110, 24)
-	a.controls[idTotalFiles] = a.edit(idTotalFiles, "0", 140, 168, 110, 28, true)
-	a.controls[idCalculate] = a.button(idCalculate, "重新计算", 900, 167, 125, 30)
+	a.label("归档容量计算器", 24, 172, 180, 24)
+	a.label("目标文件总数", 24, 208, 110, 24)
+	a.controls[idTotalFiles] = a.edit(idTotalFiles, "0", 140, 204, 110, 28, true)
+	a.controls[idCalculate] = a.button(idCalculate, "重新计算", 900, 203, 125, 30)
 
-	a.label("结果目录层数", 24, 210, 110, 24)
-	a.controls[idLevelCount] = a.edit(idLevelCount, "3", 140, 206, 58, 28, true)
-	a.label("命名预案", 220, 210, 80, 24)
-	a.controls[idPreset] = a.combo(idPreset, 300, 206, 260, 220)
-	a.label("叶目录文件数", 590, 210, 110, 24)
-	a.controls[idFilesLeaf] = a.edit(idFilesLeaf, "30", 700, 206, 70, 28, true)
+	a.label("结果目录层数", 24, 246, 110, 24)
+	a.controls[idLevelCount] = a.edit(idLevelCount, "3", 140, 242, 58, 28, true)
+	a.label("命名预案", 220, 246, 80, 24)
+	a.controls[idPreset] = a.combo(idPreset, 300, 242, 260, 220)
+	a.label("叶目录文件数", 590, 246, 110, 24)
+	a.controls[idFilesLeaf] = a.edit(idFilesLeaf, "30", 700, 242, 70, 28, true)
 
 	for i := 0; i < maxLevels; i++ {
-		y := int32(252 + i*40)
+		y := int32(288 + i*40)
 		row := levelRow{}
 		row.nameLabel = a.label(fmt.Sprintf("第 %d 层目录名", i+1), 24, y, 110, 24)
 		row.nameEdit = a.edit(idLevelNameBase+i, "", 140, y-3, 150, 28, false)
@@ -461,19 +471,19 @@ func (a *app) createControls() {
 		a.levelRows = append(a.levelRows, row)
 	}
 
-	a.label("计算结果", 500, 252, 120, 24)
-	a.controls[idResult] = a.textArea(idResult, 500, 279, 525, 145)
+	a.label("计算结果", 500, 288, 120, 24)
+	a.controls[idResult] = a.textArea(idResult, 500, 315, 525, 145)
 	a.setReadOnly(a.controls[idResult])
 
-	a.label("预览", 24, 450, 90, 24)
-	a.button(idPreviewPrev, "上一页", 360, 444, 68, 28)
-	a.button(idPreviewNext, "下一页", 436, 444, 68, 28)
-	a.controls[idPreview] = a.textArea(idPreview, 24, 476, 490, 180)
+	a.label("预览", 24, 486, 90, 24)
+	a.button(idPreviewPrev, "上一页", 360, 480, 68, 28)
+	a.button(idPreviewNext, "下一页", 436, 480, 68, 28)
+	a.controls[idPreview] = a.textArea(idPreview, 24, 512, 490, 180)
 	a.applyContentFont(a.controls[idPreview])
 	a.setReadOnly(a.controls[idPreview])
 
-	a.label("日志", 526, 450, 90, 24)
-	a.controls[idLog] = a.textArea(idLog, 526, 476, 499, 180)
+	a.label("日志", 526, 486, 90, 24)
+	a.controls[idLog] = a.textArea(idLog, 526, 512, 499, 180)
 	a.applyContentFont(a.controls[idLog])
 	a.setReadOnly(a.controls[idLog])
 
@@ -488,6 +498,7 @@ func (a *app) createControls() {
 func (a *app) setActionState(scan, dryRun, move, cancel, undo bool) {
 	win.EnableWindow(a.controls[idScan], scan)
 	win.EnableWindow(a.controls[idDryRun], dryRun)
+	win.EnableWindow(a.controls[idFeedDryRun], scan)
 	win.EnableWindow(a.controls[idMove], move)
 	win.EnableWindow(a.controls[idCancel], cancel)
 	win.EnableWindow(a.controls[idUndo], undo)
@@ -495,7 +506,7 @@ func (a *app) setActionState(scan, dryRun, move, cancel, undo bool) {
 
 func (a *app) setConfigurationEnabled(enabled bool) {
 	ids := []int{
-		idSourceEdit, idBrowse, idTargetEdit, idBrowseTarget,
+		idSourceEdit, idBrowse, idTargetEdit, idBrowseTarget, idFeedEdit, idBrowseFeed,
 		idTotalFiles, idCalculate, idLevelCount, idPreset, idFilesLeaf,
 	}
 	for _, id := range ids {
@@ -528,6 +539,15 @@ func (a *app) handleCommand(wParam, lParam uintptr) {
 		if code == win.BN_CLICKED {
 			current := strings.TrimSpace(a.text(a.controls[idTargetEdit]))
 			a.startBrowse(idBrowseTarget, "选择归档目标目录", current, "", "")
+		}
+	case idBrowseFeed:
+		if code == win.BN_CLICKED {
+			current := strings.TrimSpace(a.text(a.controls[idFeedEdit]))
+			a.startBrowse(idBrowseFeed, "选择投料目录", current, "", "")
+		}
+	case idFeedDryRun:
+		if code == win.BN_CLICKED {
+			a.generateFeedDryRun()
 		}
 	case idScan:
 		if code == win.BN_CLICKED {
@@ -572,6 +592,9 @@ func (a *app) handleCommand(wParam, lParam uintptr) {
 			a.invalidatePlanForConfigurationChange()
 		}
 	default:
+		if !a.initializing && lParam != 0 && code == win.EN_CHANGE && id == idFeedEdit {
+			a.invalidateFeedState()
+		}
 		if !a.initializing && lParam != 0 && code == win.EN_CHANGE && (id == idSourceEdit || id == idTargetEdit) {
 			a.invalidatePathDependentState()
 		}
@@ -651,7 +674,7 @@ func (a *app) finishBrowse() {
 	a.browseThreadID = 0
 	a.browseCancelRequested = false
 	hasScan := len(a.scanResult.Files) > 0 && a.scanResult.ErrorCount == 0 && !a.scanResult.Cancelled
-	hasPlan := len(a.currentPlan.Items) > 0 && a.currentPlan.ErrorCount == 0
+	hasPlan := canEnableMove(a.currentPlan, a.dryRunError, a.dryRunTSV)
 	hasManifest := a.lastManifestAvailable
 	closing := a.closing
 	a.mu.Unlock()
@@ -677,6 +700,11 @@ func (a *app) finishBrowse() {
 		a.log("当前目标目录: " + strings.TrimSpace(a.text(a.controls[idTargetEdit])))
 		return
 	}
+	if kind == idBrowseFeed {
+		a.setText(a.controls[idFeedEdit], path)
+		a.log("已选择投料目录: " + path)
+		return
+	}
 	a.setText(a.controls[idTargetEdit], path)
 	a.log("已选择目标目录: " + path)
 }
@@ -690,6 +718,8 @@ func (a *app) invalidatePathDependentState() {
 	a.scanResult = archive.ScanResult{}
 	a.currentPlan = archive.MovePlan{}
 	a.currentPlanConfig = archive.PlanConfig{}
+	a.currentPlanSource = ""
+	a.currentPlanFeed = false
 	a.dryRunPreview = ""
 	a.dryRunLines = nil
 	a.dryRunTSV = ""
@@ -701,12 +731,33 @@ func (a *app) invalidatePathDependentState() {
 	a.setActionState(true, false, false, false, hasManifest)
 }
 
+func (a *app) invalidateFeedState() {
+	a.mu.Lock()
+	if a.scanning || a.dryRunning || a.moving || !a.currentPlanFeed {
+		a.mu.Unlock()
+		return
+	}
+	a.currentPlan = archive.MovePlan{}
+	a.currentPlanConfig = archive.PlanConfig{}
+	a.currentPlanSource = ""
+	a.currentPlanFeed = false
+	hasScan := len(a.scanResult.Files) > 0
+	hasManifest := a.lastManifestAvailable
+	a.mu.Unlock()
+	a.setTextNoFlicker(a.controls[idPreview], "投料路径已变化，请重新生成投料 Dry-run。")
+	a.setActionState(true, hasScan, false, false, hasManifest)
+}
+
 func isPlanConfigurationControl(id int) bool {
 	if id == idLevelCount || id == idFilesLeaf {
 		return true
 	}
 	return (id >= idLevelNameBase && id < idLevelNameBase+maxLevels) ||
 		(id >= idLevelFolderBase && id < idLevelFolderBase+maxLevels)
+}
+
+func canEnableMove(plan archive.MovePlan, dryRunError, dryRunTSV string) bool {
+	return len(plan.Items) > 0 && plan.ErrorCount == 0 && dryRunError == "" && dryRunTSV != ""
 }
 
 func (a *app) invalidatePlanForConfigurationChange() {
@@ -751,7 +802,7 @@ func isConfigurationCommand(id, code int) bool {
 	if code != win.EN_CHANGE {
 		return false
 	}
-	if id == idSourceEdit || id == idTargetEdit || id == idTotalFiles || id == idLevelCount || id == idFilesLeaf {
+	if id == idSourceEdit || id == idTargetEdit || id == idFeedEdit || id == idTotalFiles || id == idLevelCount || id == idFilesLeaf {
 		return true
 	}
 	return (id >= idLevelNameBase && id < idLevelNameBase+maxLevels) ||
@@ -926,6 +977,11 @@ func (a *app) generateDryRun() {
 	a.mu.Lock()
 	a.dryRunning = true
 	a.dryRunCancel = cancel
+	a.currentPlan = archive.MovePlan{}
+	a.currentPlanConfig = archive.PlanConfig{}
+	a.currentPlanSource = ""
+	a.currentPlanFeed = false
+	a.currentFeedAudit = archive.FeedAudit{}
 	a.dryRunPreview = ""
 	a.dryRunTSV = ""
 	a.dryRunError = ""
@@ -953,9 +1009,9 @@ func (a *app) generateDryRun() {
 	a.log("开始生成 Dry-run。")
 
 	go func() {
-		if err := archive.CheckTargetRootContext(ctx, cfg.TargetDir); err != nil {
+		if err := archive.CheckNormalTargetContext(ctx, cfg); err != nil {
 			a.mu.Lock()
-			a.dryRunError = "目标目录不可访问: " + err.Error()
+			a.dryRunError = "普通归档目标校验失败: " + err.Error()
 			a.dryRunning = false
 			a.dryRunCancel = nil
 			a.mu.Unlock()
@@ -1031,6 +1087,8 @@ func (a *app) generateDryRun() {
 		if ctx.Err() == nil {
 			a.currentPlan = plan
 			a.currentPlanConfig = cfg
+			a.currentPlanSource = sourceRoot
+			a.currentPlanFeed = false
 		}
 		a.dryRunLines = lines
 		a.dryRunTSV = tsvPath
@@ -1197,18 +1255,19 @@ func (a *app) startMove() {
 	}
 	plan := a.currentPlan
 	planCfg := a.currentPlanConfig
+	planSource := a.currentPlanSource
+	isFeed := a.currentPlanFeed
+	feedAudit := a.currentFeedAudit
+	dryRunError := a.dryRunError
+	dryRunTSV := a.dryRunTSV
 	a.mu.Unlock()
 	currentCfg := a.planConfig(len(plan.Items))
 	if err := archive.ValidateLevelNames(currentCfg.LevelNames); err != nil {
 		a.log("目录名配置无效: " + err.Error())
 		return
 	}
-	if len(plan.Items) == 0 {
-		a.log("请先生成 dry-run。")
-		return
-	}
-	if plan.ErrorCount > 0 {
-		a.log("当前 dry-run 存在错误项，请修正后重新生成。")
+	if !canEnableMove(plan, dryRunError, dryRunTSV) {
+		a.log("请先完成没有错误的 Dry-run，再开始移动。")
 		return
 	}
 	if !samePlanConfig(planCfg, currentCfg) {
@@ -1216,7 +1275,14 @@ func (a *app) startMove() {
 		a.invalidatePlanForConfigurationChange()
 		return
 	}
+	if isFeed && !archive.SamePath(planSource, strings.TrimSpace(a.text(a.controls[idFeedEdit]))) {
+		a.log("投料目录已变化，请重新生成投料 Dry-run。")
+		return
+	}
 	confirmText := fmt.Sprintf("即将移动 %d 个文件。\r\n目标目录：%s\r\n\r\n确认开始正式移动？", len(plan.Items), plan.TargetRoot)
+	if isFeed && feedAudit.RequiresAdoption {
+		confirmText = fmt.Sprintf("此目标是旧归档，尚未记录原始结构参数。\r\n请核对当前层级名称、目录数量与每叶文件数确为原设定。\r\n确认后将把当前设置绑定到目标目录，并移动 %d 个投料文件。\r\n\r\n目标目录：%s\r\n\r\n确认绑定并投料？", len(plan.Items), plan.TargetRoot)
+	}
 	if win.MessageBox(a.hwnd, syscall.StringToUTF16Ptr(confirmText), syscall.StringToUTF16Ptr("确认移动"), win.MB_YESNO|win.MB_ICONWARNING|win.MB_DEFBUTTON2) != win.IDYES {
 		a.log("已取消正式移动。")
 		return
@@ -1239,7 +1305,7 @@ func (a *app) startMove() {
 	a.setProgress(0, len(plan.Items))
 	a.log("开始正式移动文件。")
 
-	sourceRoot := strings.TrimSpace(a.text(a.controls[idSourceEdit]))
+	sourceRoot := planSource
 	targetRoot := strings.TrimSpace(a.text(a.controls[idTargetEdit]))
 	networkMove := archive.IsLikelyNetworkPath(sourceRoot) || archive.IsLikelyNetworkPath(targetRoot) || archive.IsLikelyNetworkPath(plan.TargetRoot)
 	a.mu.Lock()
@@ -1255,8 +1321,39 @@ func (a *app) startMove() {
 	}
 
 	go func() {
+		targetLock, lockErr := archive.AcquireTargetMoveLock(ctx, plan.TargetRoot)
+		if lockErr != nil {
+			a.mu.Lock()
+			a.moveSummary = archive.MoveSummary{Total: len(plan.Items), Failed: len(plan.Items), Error: "目标目录加锁失败: " + lockErr.Error()}
+			a.moving = false
+			a.moveCancel = nil
+			a.mu.Unlock()
+			win.PostMessage(a.hwnd, wmMoveComplete, 0, 0)
+			return
+		}
+		defer targetLock.Close()
+		if isFeed {
+			audit := archive.AuditFeedTarget(ctx, planCfg)
+			if len(audit.Errors) > 0 || !sameFeedAudit(feedAudit, audit) {
+				a.mu.Lock()
+				a.moveSummary = archive.MoveSummary{Total: len(plan.Items), Failed: len(plan.Items), Error: "目标目录已变化，请重新生成投料 Dry-run"}
+				a.moving = false
+				a.moveCancel = nil
+				a.mu.Unlock()
+				win.PostMessage(a.hwnd, wmMoveComplete, 0, 0)
+				return
+			}
+		} else if err := archive.CheckNormalTargetContext(ctx, planCfg); err != nil {
+			a.mu.Lock()
+			a.moveSummary = archive.MoveSummary{Total: len(plan.Items), Failed: len(plan.Items), Error: "普通归档目标复审失败: " + err.Error()}
+			a.moving = false
+			a.moveCancel = nil
+			a.mu.Unlock()
+			win.PostMessage(a.hwnd, wmMoveComplete, 0, 0)
+			return
+		}
 		lastPost := time.Now().Add(-time.Second)
-		summary := archive.ExecuteMovePlan(ctx, plan, archive.MoveOptions{ReportItemStart: networkMove}, func(progress archive.MoveProgress) {
+		summary := archive.ExecuteMovePlan(ctx, plan, archive.MoveOptions{ReportItemStart: networkMove, TargetLock: targetLock}, func(progress archive.MoveProgress) {
 			if progress.Status != "processing" && time.Since(lastPost) < 250*time.Millisecond && progress.Index != progress.Total {
 				return
 			}
@@ -1275,6 +1372,21 @@ func (a *app) startMove() {
 			a.mu.Unlock()
 			win.PostMessage(a.hwnd, wmMoveProgress, 0, 0)
 		})
+		if summary.Moved > 0 {
+			bindCtx, bindCancel := context.WithTimeout(context.Background(), 2*time.Minute)
+			var baselineFiles []archive.VideoFile
+			if isFeed {
+				baselineFiles = feedAudit.Files
+			}
+			err := archive.BindStructureToManifest(bindCtx, planCfg, summary.ManifestPath, baselineFiles)
+			bindCancel()
+			if err != nil {
+				if summary.Error != "" {
+					summary.Error += "; "
+				}
+				summary.Error += "文件已移动，但结构记录提交失败: " + err.Error()
+			}
+		}
 		if !summary.Cancelled && summary.Error == "" && summary.Moved > 0 && sourceRoot != "" {
 			if archive.IsLikelyNetworkPath(sourceRoot) {
 				a.mu.Lock()
@@ -1443,6 +1555,8 @@ func (a *app) finishMove() {
 	summary := a.moveSummary
 	a.currentPlan = archive.MovePlan{}
 	a.currentPlanConfig = archive.PlanConfig{}
+	a.currentPlanSource = ""
+	a.currentPlanFeed = false
 	lastManifest, newManifest := manifestAfterMove(a.lastManifest, summary)
 	a.lastManifest = lastManifest
 	if newManifest {
@@ -1468,7 +1582,7 @@ func (a *app) finishMove() {
 }
 
 func manifestAfterMove(existing string, summary archive.MoveSummary) (string, bool) {
-	if summary.ManifestPath != "" && summary.Moved > 0 {
+	if summary.ManifestPath != "" && (summary.Moved > 0 || summary.PendingRecovery) {
 		return summary.ManifestPath, true
 	}
 	return existing, false
@@ -1703,6 +1817,7 @@ func (a *app) finishManifestCheck() {
 func (a *app) applyConfig(cfg appconfig.Config, manifestAvailable bool) {
 	a.setText(a.controls[idSourceEdit], cfg.SourceDir)
 	a.setText(a.controls[idTargetEdit], cfg.TargetDir)
+	a.setText(a.controls[idFeedEdit], cfg.FeedDir)
 	if cfg.LevelCount > 0 {
 		a.setText(a.controls[idLevelCount], strconv.Itoa(clamp(cfg.LevelCount, 1, maxLevels)))
 	}
@@ -1738,6 +1853,7 @@ func (a *app) configSnapshot() appconfig.Config {
 	return appconfig.Config{
 		SourceDir:       strings.TrimSpace(a.text(a.controls[idSourceEdit])),
 		TargetDir:       strings.TrimSpace(a.text(a.controls[idTargetEdit])),
+		FeedDir:         strings.TrimSpace(a.text(a.controls[idFeedEdit])),
 		LevelCount:      levelCount,
 		LevelNames:      names,
 		FoldersPerLevel: folders,

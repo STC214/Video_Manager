@@ -614,3 +614,283 @@ func TestMoveOneHonorsCancellationBeforeRename(t *testing.T) {
 		t.Fatalf("cancelled move created target: %v", err)
 	}
 }
+
+func TestMoveOnePreservesLateTargetCollision(t *testing.T) {
+	root := t.TempDir()
+	source := filepath.Join(root, "source.mp4")
+	target := filepath.Join(root, "target.mp4")
+	if err := os.WriteFile(source, []byte("new video"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The target appears after Dry-run chose this path.
+	if err := os.WriteFile(target, []byte("existing video"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	_, err = moveOne(context.Background(), MovePlanItem{SourcePath: source, TargetPath: target, Size: info.Size(), ModTime: info.ModTime(), Status: "planned"})
+	if err == nil {
+		t.Fatal("late target collision was overwritten")
+	}
+	gotTarget, err := os.ReadFile(target)
+	if err != nil || string(gotTarget) != "existing video" {
+		t.Fatalf("target changed: %q, %v", gotTarget, err)
+	}
+	gotSource, err := os.ReadFile(source)
+	if err != nil || string(gotSource) != "new video" {
+		t.Fatalf("source changed: %q, %v", gotSource, err)
+	}
+}
+
+func TestTargetMoveLockWaitsAndCancels(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "archive")
+	first, err := AcquireTargetMoveLock(t.Context(), root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.Close()
+	ctx, cancel := context.WithTimeout(t.Context(), 150*time.Millisecond)
+	defer cancel()
+	if second, err := AcquireTargetMoveLock(ctx, root); !errors.Is(err, context.DeadlineExceeded) {
+		if second != nil {
+			_ = second.Close()
+		}
+		t.Fatalf("second lock = %v, want deadline", err)
+	}
+	if err := first.Close(); err != nil {
+		t.Fatal(err)
+	}
+	second, err := AcquireTargetMoveLock(t.Context(), root)
+	if err != nil {
+		t.Fatalf("lock after release: %v", err)
+	}
+	_ = second.Close()
+}
+
+func TestConcurrentMovePlansKeepLeafCapacity(t *testing.T) {
+	root := t.TempDir()
+	targetRoot := filepath.Join(root, "archive")
+	leaf := filepath.Join(targetRoot, "Episode_001")
+	if err := os.MkdirAll(leaf, 0755); err != nil {
+		t.Fatal(err)
+	}
+	results := make(chan MoveSummary, 2)
+	for _, name := range []string{"a.mp4", "b.mp4"} {
+		source := filepath.Join(root, name)
+		if err := os.WriteFile(source, []byte(name), 0644); err != nil {
+			t.Fatal(err)
+		}
+		info, err := os.Stat(source)
+		if err != nil {
+			t.Fatal(err)
+		}
+		plan := MovePlan{TargetRoot: targetRoot, TargetDirFileLimit: 1, ManagedExtensions: []string{".mp4"}, Items: []MovePlanItem{{SourcePath: source, TargetPath: filepath.Join(leaf, name), Size: info.Size(), ModTime: info.ModTime(), Status: "planned"}}}
+		go func() { results <- ExecuteMovePlan(t.Context(), plan, MoveOptions{}, nil) }()
+	}
+	first, second := <-results, <-results
+	if first.Moved+second.Moved != 1 || first.Failed+second.Failed != 1 {
+		t.Fatalf("concurrent summaries: %+v; %+v", first, second)
+	}
+	entries, err := os.ReadDir(leaf)
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("leaf entries = %v, %v", entries, err)
+	}
+}
+
+func TestExecuteMovePlanRejectsStaleTargetLock(t *testing.T) {
+	root := t.TempDir()
+	lock, err := AcquireTargetMoveLock(t.Context(), filepath.Join(root, "other"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lock.Close()
+	plan := MovePlan{TargetRoot: filepath.Join(root, "target"), Items: []MovePlanItem{{SourcePath: "source", TargetPath: "target"}}}
+	summary := ExecuteMovePlan(t.Context(), plan, MoveOptions{TargetLock: lock}, nil)
+	if summary.Moved != 0 || summary.Failed != 1 || !strings.Contains(summary.Error, "target move lock") {
+		t.Fatalf("summary = %+v", summary)
+	}
+}
+
+func TestCopyVerifyDeleteKeepsLatePublishedTarget(t *testing.T) {
+	root := t.TempDir()
+	source := filepath.Join(root, "source.mp4")
+	target := filepath.Join(root, "target.mp4")
+	if err := os.WriteFile(source, []byte("ours"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = copyVerifyDeleteWithHooks(t.Context(), source, target, info, func() {
+		if _, statErr := os.Stat(target); !os.IsNotExist(statErr) {
+			t.Fatalf("unverified target became visible: %v", statErr)
+		}
+		if writeErr := os.WriteFile(target, []byte("theirs"), 0644); writeErr != nil {
+			t.Fatal(writeErr)
+		}
+	}, os.Chtimes)
+	if err == nil || !strings.Contains(err.Error(), "cannot publish verified copy") {
+		t.Fatalf("copy error = %v", err)
+	}
+	if data, err := os.ReadFile(target); err != nil || string(data) != "theirs" {
+		t.Fatalf("late target = %q, %v", data, err)
+	}
+	if data, err := os.ReadFile(source); err != nil || string(data) != "ours" {
+		t.Fatalf("source = %q, %v", data, err)
+	}
+	matches, err := filepath.Glob(filepath.Join(root, ".video-manager-copy-*.tmp"))
+	if err != nil || len(matches) != 0 {
+		t.Fatalf("staging leftovers = %v, %v", matches, err)
+	}
+}
+
+func TestUndoWaitsForTargetMoveLock(t *testing.T) {
+	root := t.TempDir()
+	source := filepath.Join(root, "source.mp4")
+	targetRoot := filepath.Join(root, "archive")
+	if err := os.WriteFile(source, []byte("video"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan := BuildMovePlan([]VideoFile{{SourcePath: source, Name: "source.mp4", Size: info.Size(), ModTime: info.ModTime()}}, PlanConfig{
+		TargetDir: targetRoot, LevelCount: 1, LevelNames: []string{"Episode"}, FoldersPerLevel: []int{1}, FilesPerLeaf: 1,
+	})
+	move := ExecuteMovePlan(t.Context(), plan, MoveOptions{ManifestDir: filepath.Join(root, "custom-manifests")}, nil)
+	if move.Moved != 1 || move.Failed != 0 {
+		t.Fatalf("move = %+v", move)
+	}
+	if got, err := manifestTargetRoot(move.ManifestPath); err != nil || !SamePath(got, targetRoot) {
+		t.Fatalf("manifest target root = %q, %v", got, err)
+	}
+	lock, err := AcquireTargetMoveLock(t.Context(), targetRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 150*time.Millisecond)
+	defer cancel()
+	undo := UndoManifest(ctx, move.ManifestPath, nil)
+	if undo.Restored != 0 || undo.Failed != 1 || !strings.Contains(undo.Error, "cannot lock target for undo") {
+		t.Fatalf("undo while locked = %+v", undo)
+	}
+	if err := lock.Close(); err != nil {
+		t.Fatal(err)
+	}
+	undo = UndoManifest(t.Context(), move.ManifestPath, nil)
+	if undo.Restored != 1 || undo.Failed != 0 {
+		t.Fatalf("undo after release = %+v", undo)
+	}
+}
+
+func TestPublishedCopyCleanupPreservesReplacement(t *testing.T) {
+	root := t.TempDir()
+	target := filepath.Join(root, "target.mp4")
+	if err := os.WriteFile(target, []byte("ours"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	owned, err := os.Stat(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !os.SameFile(owned, owned) {
+		t.Fatal("file identity unavailable")
+	}
+	if err := os.Remove(target); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(target, []byte("theirs"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	err = handlePublishedCopyDeleteFailure(errors.New("source locked"), target, owned)
+	var pending *publishedCopyError
+	if !errors.As(err, &pending) {
+		t.Fatalf("cleanup result = %v, want pending recovery", err)
+	}
+	if data, err := os.ReadFile(target); err != nil || string(data) != "theirs" {
+		t.Fatalf("replacement = %q, %v", data, err)
+	}
+}
+
+func TestPublishedCopyCleanupRemovesOwnedTarget(t *testing.T) {
+	target := filepath.Join(t.TempDir(), "target.mp4")
+	if err := os.WriteFile(target, []byte("ours"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	owned, err := os.Stat(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = handlePublishedCopyDeleteFailure(errors.New("source locked"), target, owned)
+	var pending *publishedCopyError
+	if err == nil || errors.As(err, &pending) {
+		t.Fatalf("cleanup result = %v, want ordinary move error", err)
+	}
+	if _, err := os.Stat(target); !os.IsNotExist(err) {
+		t.Fatalf("owned target survived cleanup: %v", err)
+	}
+}
+
+func TestCopyPreservesSourceReplacementWithSameMetadata(t *testing.T) {
+	root := t.TempDir()
+	source := filepath.Join(root, "source.mp4")
+	target := filepath.Join(root, "target.mp4")
+	if err := os.WriteFile(source, []byte("original"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = copyVerifyDeleteWithHooks(t.Context(), source, target, info, func() {
+		if err := os.Remove(source); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(source, []byte("replaced"), 0644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chtimes(source, info.ModTime(), info.ModTime()); err != nil {
+			t.Fatal(err)
+		}
+	}, os.Chtimes)
+	if err == nil {
+		t.Fatal("source replacement was accepted")
+	}
+	if data, err := os.ReadFile(source); err != nil || string(data) != "replaced" {
+		t.Fatalf("source replacement = %q, %v", data, err)
+	}
+}
+
+func TestCopyReadOnlySourceDoesNotPublishTarget(t *testing.T) {
+	root := t.TempDir()
+	source := filepath.Join(root, "readonly.mp4")
+	target := filepath.Join(root, "target.mp4")
+	if err := os.WriteFile(source, []byte("video"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(source, 0444); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chmod(source, 0666)
+	info, err := os.Stat(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm()&0200 != 0 {
+		t.Skip("filesystem does not expose read-only mode")
+	}
+	err = copyVerifyDelete(t.Context(), source, target, info)
+	if err == nil {
+		t.Fatal("read-only source copied then removed")
+	}
+	if _, err := os.Stat(source); err != nil {
+		t.Fatalf("read-only source changed: %v", err)
+	}
+	if _, err := os.Stat(target); !os.IsNotExist(err) {
+		t.Fatalf("read-only source published target: %v", err)
+	}
+}
